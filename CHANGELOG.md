@@ -2,6 +2,18 @@
 
 All notable changes to `/watch` are documented here.
 
+## [Unreleased]
+
+### Added
+- **Local Whisper backend (`mlx`)** — on Apple Silicon, `/watch` transcribes with the `mlx_whisper` CLI (`pipx install mlx-whisper`; `whisper-large-v3-turbo` on the GPU). No API key, nothing uploaded, no per-minute cost. Found on PATH or in pipx's `~/.local/bin`. `setup.py --warm` pre-fetches the ~1.5 GB model once so the first run isn't a silent download; `setup.py --json` reports `has_mlx_whisper`, `mlx_model_cached`, `apple_silicon`.
+- **`--whisper mlx|groq|openai`** and **`WATCH_WHISPER=`** in `~/.config/watch/.env` to pin a backend.
+- **Transcript verification.** Every Whisper result is scanned for the decoder's silent repetition loops (≥3 identical consecutive segments). On `mlx`, looped windows are re-transcribed in isolation at higher temperature and spliced back; anything remaining is printed as a `> **Warning: transcript verification failed**` block naming the windows. A transcript that stops well before the audio ends gets an advisory note (usually outro music/silence). New modules `scripts/verify.py`, `scripts/local_whisper.py`.
+
+### Changed
+- **Whisper backend order is now `auto` = `mlx` if installed → Groq → OpenAI.** If you have both mlx-whisper and a Groq key, local wins; set `WATCH_WHISPER=groq` to keep the old behaviour. When `auto` picks `mlx` and it fails at runtime (broken venv, interrupted model download), the run falls back to your API key instead of reporting no transcript.
+- **Frame dedup compares per tile, not whole-frame.** The 16×16 whole-frame mean collapsed slide decks: two different slides on one template differ by only ~1.4–2/255 whole-frame, under the 2.0 threshold, so slides were dropped as duplicates. Dedup now uses a 64×64 thumbnail split into an 8×8 grid and keeps a frame if *any* tile moves. Held frames still collapse; a slide gaining a bullet is kept.
+- Setup no longer nags for an API key when `mlx_whisper` is installed; the SessionStart hook and installer mention the local option.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added

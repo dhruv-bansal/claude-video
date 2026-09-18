@@ -9,6 +9,7 @@ zooming in for detail).
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -29,13 +30,21 @@ SCENE_MIN_FRAMES = 8
 KEYFRAME_MIN = 4
 MAX_READ_DIMENSION = 1998
 # Frame-delta dedup: downscale each frame to a DEDUP_THUMB x DEDUP_THUMB
-# grayscale thumbnail and treat two frames as near-identical when their mean
-# per-pixel difference (0-255) is at or below DEDUP_THRESHOLD. Conservative on
-# purpose: only collapses frames that are visually the same shot, so a code diff
-# / scrolling terminal / slide-gaining-a-bullet survives. Unlike a within-frame
-# perceptual hash, this distinguishes flat frames (solid slides, fades) by luma.
-DEDUP_THUMB = 16
+# grayscale thumbnail, split it into a DEDUP_GRID x DEDUP_GRID grid of tiles,
+# and treat two frames as near-identical only when EVERY tile's mean per-pixel
+# difference (0-255) is at or below DEDUP_THRESHOLD.
+#
+# Per-tile, not whole-frame, on purpose. Two different slides on the same
+# template differ by a whole-frame mean of only ~1.4/255 — text covers so few
+# pixels that a global mean barely moves — so any whole-frame threshold above
+# that silently deletes the deck. A localized change (one bullet, a code diff,
+# a dialog opening) lights up the tile it lands in, while a genuinely held
+# frame stays flat everywhere. Unlike a within-frame perceptual hash, this
+# still distinguishes flat frames (solid slides, fades) by luma.
+DEDUP_THUMB = 64
+DEDUP_GRID = 8
 DEDUP_THRESHOLD = 2.0
+assert DEDUP_THUMB % DEDUP_GRID == 0, "tiles must divide the thumbnail exactly"
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 
 
@@ -421,6 +430,37 @@ def _frame_delta(a: bytes, b: bytes) -> float:
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
+def _tile_delta(a: bytes, b: bytes, grid: int = DEDUP_GRID) -> float:
+    """Largest per-tile mean absolute difference (0-255) between two square
+    grayscale thumbnails split into a ``grid`` x ``grid`` lattice.
+
+    This is the dedup signal: it answers "did *any region* change?" rather
+    than "did the average pixel change?", which is what keeps slide text from
+    being averaged away. Thumbnails smaller than the grid fall back to one
+    pixel per tile. Mismatched / non-square input is maximally different.
+    """
+    if not a or len(a) != len(b):
+        return float("inf")
+    side = math.isqrt(len(a))
+    if side * side != len(a):
+        return float("inf")
+    grid = max(1, min(grid, side))
+    tile = side // grid  # a ragged right/bottom edge (side % grid) is ignored
+
+    worst = 0.0
+    for gy in range(grid):
+        for gx in range(grid):
+            total = 0
+            for y in range(gy * tile, (gy + 1) * tile):
+                row = y * side + gx * tile
+                for i in range(row, row + tile):
+                    total += abs(a[i] - b[i])
+            mean = total / (tile * tile)
+            if mean > worst:
+                worst = mean
+    return worst
+
+
 def _thumb_frames(paths: list[Path]) -> list[bytes]:
     """Decode every frame in ``paths`` to a small grayscale thumbnail via one
     ffmpeg pass over the JPEG sequence.
@@ -465,8 +505,8 @@ def dedupe_perceptual(
 ) -> tuple[list[dict], int]:
     """Drop near-identical frames from a chronological candidate list.
 
-    Thumbnails the extracted JPEGs and greedily removes frames whose mean
-    per-pixel difference from the last kept one is within ``threshold``. Returns
+    Thumbnails the extracted JPEGs and greedily removes frames where no tile
+    differs from the last kept one by more than ``threshold``. Returns
     ``(survivors, dropped_count)``; a no-op (unchanged list) when thumbnails are
     unavailable or there are fewer than two candidates.
     """
@@ -479,10 +519,11 @@ def dedupe_perceptual(
 def _dedupe_by_deltas(
     candidates: list[dict], thumbs: list[bytes], threshold: float = DEDUP_THRESHOLD
 ) -> tuple[list[dict], int]:
-    """Greedily drop frames within ``threshold`` mean per-pixel difference of the
-    last *kept* frame. Deletes dropped JPEGs and reindexes survivors 0..n-1 (same
-    cleanup contract as :func:`_even_sample`). Fail-open: if ``thumbs`` does not
-    line up 1:1 with ``candidates``, return them unchanged.
+    """Greedily drop frames whose every tile is within ``threshold`` mean
+    per-pixel difference of the last *kept* frame (:func:`_tile_delta`).
+    Deletes dropped JPEGs and reindexes survivors 0..n-1 (same cleanup contract
+    as :func:`_even_sample`). Fail-open: if ``thumbs`` does not line up 1:1
+    with ``candidates``, return them unchanged.
     """
     if len(thumbs) != len(candidates) or len(candidates) <= 1:
         return candidates, 0
@@ -491,7 +532,7 @@ def _dedupe_by_deltas(
     last = thumbs[0]
     dropped: list[dict] = []
     for cand, thumb in zip(candidates[1:], thumbs[1:]):
-        if _frame_delta(thumb, last) <= threshold:
+        if _tile_delta(thumb, last) <= threshold:
             dropped.append(cand)
         else:
             kept.append(cand)

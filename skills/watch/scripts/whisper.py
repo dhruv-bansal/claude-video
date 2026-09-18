@@ -25,6 +25,12 @@ import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+# Local (Apple Silicon) backend and transcript verification live in their own
+# modules; this file only routes to them.
+from local_whisper import mlx_available, model_cached, repair_loops, transcribe_mlx  # noqa: E402
+from verify import report_quality, verify_segments  # noqa: E402
+
+BACKENDS = ("mlx", "groq", "openai")
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3"
@@ -112,12 +118,41 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     return None, None
 
 
+def resolve_backend(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
+    """Pick the Whisper backend to use. Returns (backend, api_key).
+
+    `api_key` is "" for the local mlx backend (it needs none). Order for
+    "auto": mlx when installed (free, private, no upload), then Groq, then
+    OpenAI. A `preferred` backend — from `--whisper` or the WATCH_WHISPER
+    config — restricts the choice to that one; when it is unavailable,
+    (None, None) is returned so the caller can explain why.
+    """
+    if preferred is None:
+        from config import get_config  # local import: keeps whisper.py usable standalone
+        preferred = str(get_config().get("whisper") or "auto")
+
+    if preferred == "mlx":
+        return ("mlx", "") if mlx_available() else (None, None)
+    if preferred in ("groq", "openai"):
+        return load_api_key(preferred)
+    if mlx_available():
+        return "mlx", ""
+    return load_api_key()
+
+
 def extract_audio(video_path: str, out_path: Path) -> Path:
-    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
+    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit.
+
+    A `.wav` out_path yields 16-bit PCM instead (what a local Whisper consumes
+    natively; there is no upload cap to fit)."""
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.suffix.lower() == ".wav":
+        codec = ["-acodec", "pcm_s16le"]
+    else:
+        codec = ["-acodec", "libmp3lame", "-b:a", "64k"]
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -125,10 +160,9 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
         "-y",
         "-i", str(Path(video_path).resolve()),
         "-vn",
-        "-acodec", "libmp3lame",
+        *codec,
         "-ar", "16000",
         "-ac", "1",
-        "-b:a", "64k",
         str(out_path.resolve()),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -411,27 +445,64 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
     return _segments_from_response(response)
 
 
+def _transcribe_local(video_path: str, audio_out: Path) -> tuple[list[dict], str, dict]:
+    """The mlx path: PCM audio, one local decode, verify, repair loops, re-verify."""
+    audio_out = audio_out.with_suffix(".wav")  # no upload cap → no mp3, no chunking
+    print("[watch] extracting audio for Whisper (mlx)…", file=sys.stderr)
+    audio_path = extract_audio(video_path, audio_out)
+    duration = audio_duration(audio_path)
+    download = "" if model_cached() else " (first run downloads the ~1.5 GB model)"
+    print(f"[watch] transcribing {duration / 60:.1f} min locally on the GPU{download}…", file=sys.stderr)
+    work_dir = audio_out.parent / "mlx"
+    segments = transcribe_mlx(audio_path, work_dir)
+    if not segments:
+        raise SystemExit("Whisper returned no transcript segments")
+
+    quality = verify_segments(segments, duration)
+    if quality["loops"]:
+        segments = repair_loops(segments, quality["loops"], audio_path, work_dir, duration)
+        quality = verify_segments(segments, duration)
+    report_quality(quality, "mlx")
+    print(f"[watch] transcribed {len(segments)} segments via mlx", file=sys.stderr)
+    return segments, "mlx", quality
+
+
 def transcribe_video(
     video_path: str,
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
-) -> tuple[list[dict], str]:
-    """Run the full flow: extract audio → upload → parse segments.
+    api_fallback: bool = False,
+) -> tuple[list[dict], str, dict]:
+    """Run the full flow: extract audio → transcribe → verify → parse segments.
 
-    Returns (segments, backend_used). Raises SystemExit on any failure.
+    Returns (segments, backend_used, quality) where quality is the
+    verify_segments result. Raises SystemExit on any failure. With
+    `api_fallback` (backend chosen by "auto", not pinned), a local mlx failure
+    falls through to an API key if one is set, so a broken pipx venv or an
+    interrupted model download never costs a user their working Groq path.
     """
-    if backend is None or api_key is None:
-        detected_backend, detected_key = load_api_key()
-        backend = backend or detected_backend
-        api_key = api_key or detected_key
+    if backend is None:
+        backend, api_key = resolve_backend()
+    elif api_key is None and backend != "mlx":
+        _, api_key = load_api_key(backend)
+
+    if backend == "mlx":
+        try:
+            return _transcribe_local(video_path, audio_out)
+        except SystemExit as exc:
+            fallback, fallback_key = load_api_key() if api_fallback else (None, None)
+            if not fallback:
+                raise
+            print(f"[watch] local mlx failed ({exc}) — falling back to {fallback}", file=sys.stderr)
+            backend, api_key = fallback, fallback_key
 
     if not backend or not api_key:
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
-            "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            "in the environment or in ~/.config/watch/.env. "
-            f"Run `python3 {setup_py}` to configure."
+            "No Whisper backend available. Install mlx-whisper for local transcription "
+            "(`pipx install mlx-whisper`, Apple Silicon), or set GROQ_API_KEY / OPENAI_API_KEY "
+            f"in the environment or in ~/.config/watch/.env. Run `python3 {setup_py}` to configure."
         )
 
     print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
@@ -461,13 +532,15 @@ def transcribe_video(
     if not segments:
         raise SystemExit("Whisper returned no transcript segments")
 
+    quality = verify_segments(segments, audio_duration(audio_path))
+    report_quality(quality, backend)
     print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
-    return segments, backend
+    return segments, backend, quality
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend mlx|groq|openai]", file=sys.stderr)
         raise SystemExit(2)
 
     video = sys.argv[1]
@@ -476,5 +549,5 @@ if __name__ == "__main__":
     if "--backend" in sys.argv:
         backend_override = sys.argv[sys.argv.index("--backend") + 1]
 
-    segments, backend = transcribe_video(video, audio_out, backend=backend_override)
-    print(json.dumps({"backend": backend, "segments": segments}, indent=2))
+    segments, backend, quality = transcribe_video(video, audio_out, backend=backend_override)
+    print(json.dumps({"backend": backend, "quality": quality, "segments": segments}, indent=2))

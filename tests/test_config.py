@@ -26,7 +26,30 @@ def test_get_config_keys(monkeypatch, tmp_path):
     monkeypatch.delenv("WATCH_DETAIL", raising=False)
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "missing.env")
     cfg = config.get_config()
-    assert set(cfg) == {"detail", "config_file"}
+    assert set(cfg) == {"detail", "whisper", "config_file"}
+    assert cfg["whisper"] == "auto"
+
+
+def test_whisper_preference_from_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("WATCH_WHISPER", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("WATCH_WHISPER=MLX\n")
+    monkeypatch.setattr(config, "CONFIG_FILE", env)
+    assert config.get_config()["whisper"] == "mlx"  # case-insensitive
+
+
+def test_whisper_preference_env_overrides_file(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("WATCH_WHISPER=mlx\n")
+    monkeypatch.setattr(config, "CONFIG_FILE", env)
+    monkeypatch.setenv("WATCH_WHISPER", "openai")
+    assert config.get_config()["whisper"] == "openai"
+
+
+def test_whisper_preference_invalid_falls_back_to_auto(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "missing.env")
+    monkeypatch.setenv("WATCH_WHISPER", "deepgram")
+    assert config.get_config()["whisper"] == "auto"
 
 
 def test_frame_cap_mapping():

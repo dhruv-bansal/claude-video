@@ -155,3 +155,71 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+
+# --- backend resolution ------------------------------------------------------
+
+class TestResolveBackend:
+    @pytest.fixture(autouse=True)
+    def _no_keys(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("WATCH_WHISPER", raising=False)
+        # Keep the developer's real ~/.config/watch/.env and cwd .env out of it.
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.chdir(tmp_path)
+        import config
+        monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "missing.env")
+
+    def test_auto_prefers_mlx_when_installed(self, monkeypatch):
+        monkeypatch.setattr(whisper, "mlx_available", lambda: True)
+        monkeypatch.setenv("GROQ_API_KEY", "sk-groq")
+        assert whisper.resolve_backend() == ("mlx", "")
+
+    def test_auto_falls_back_to_groq_then_openai(self, monkeypatch):
+        monkeypatch.setattr(whisper, "mlx_available", lambda: False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-oa")
+        assert whisper.resolve_backend() == ("openai", "sk-oa")
+        monkeypatch.setenv("GROQ_API_KEY", "sk-groq")
+        assert whisper.resolve_backend() == ("groq", "sk-groq")
+
+    def test_auto_nothing_available(self, monkeypatch):
+        monkeypatch.setattr(whisper, "mlx_available", lambda: False)
+        assert whisper.resolve_backend() == (None, None)
+
+    def test_pinned_mlx_without_binary_does_not_fall_back(self, monkeypatch):
+        monkeypatch.setattr(whisper, "mlx_available", lambda: False)
+        monkeypatch.setenv("GROQ_API_KEY", "sk-groq")
+        assert whisper.resolve_backend("mlx") == (None, None)
+
+    def test_pinned_api_ignores_mlx(self, monkeypatch):
+        monkeypatch.setattr(whisper, "mlx_available", lambda: True)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-oa")
+        assert whisper.resolve_backend("openai") == ("openai", "sk-oa")
+        assert whisper.resolve_backend("groq") == (None, None)
+
+    def test_config_preference_is_honored(self, monkeypatch):
+        monkeypatch.setattr(whisper, "mlx_available", lambda: True)
+        monkeypatch.setenv("GROQ_API_KEY", "sk-groq")
+        monkeypatch.setenv("WATCH_WHISPER", "groq")
+        assert whisper.resolve_backend() == ("groq", "sk-groq")
+
+
+class TestExtractAudioWav:
+    def test_wav_suffix_yields_pcm(self, tmp_path: Path):
+        video = tmp_path / "v.mp4"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-t", "2", "-i", "color=c=blue:s=64x64:r=5",
+             "-f", "lavfi", "-t", "2", "-i", "sine=frequency=440:sample_rate=16000",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(video)],
+            check=True,
+        )
+        out = whisper.extract_audio(str(video), tmp_path / "audio.wav")
+        assert out.read_bytes()[:4] == b"RIFF"
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_name,sample_rate,channels", "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert probe == "pcm_s16le,16000,1"

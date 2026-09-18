@@ -4,6 +4,7 @@
 Modes:
   setup.py --check      Silent preflight. Exit 0 if ready, 2/3/4 on failure.
   setup.py --json       Machine-readable status for Claude to parse.
+  setup.py --warm       Pre-download the local mlx-whisper model (~1.5 GB, one time).
   setup.py              Installer. Auto-installs deps, scaffolds .env, marks SETUP_COMPLETE.
 
 Design:
@@ -24,12 +25,15 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from config import get_config  # noqa: E402
+from local_whisper import MLX_MODEL, mlx_available, model_cached, warm  # noqa: E402
+from whisper import resolve_backend  # noqa: E402
 
 
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
@@ -40,17 +44,26 @@ ENV_TEMPLATE = """# /watch API configuration
 # Whisper transcription fallback — used only when yt-dlp cannot get captions
 # (or when you point /watch at a local file with no subtitles).
 #
-# Groq is preferred: it runs whisper-large-v3 at a fraction of OpenAI's price
-# and is faster in practice. OpenAI is the compatible fallback.
+# Local option (Apple Silicon, no key, nothing uploaded, free):
+#   pipx install mlx-whisper
+# When mlx_whisper is on PATH it is used automatically. The API keys below
+# are only needed on other machines, or if you prefer a hosted backend.
+#
+# Groq is preferred among the APIs: it runs whisper-large-v3 at a fraction of
+# OpenAI's price and is faster in practice. OpenAI is the compatible fallback.
 #
 # Get a Groq key:  https://console.groq.com/keys
 # Get an OpenAI key:  https://platform.openai.com/api-keys
 #
-# Leave both blank to disable Whisper — /watch will still work, but videos
-# without native captions will come back frames-only.
+# Leave both blank (and skip mlx-whisper) to disable Whisper — /watch will
+# still work, but videos without native captions will come back frames-only.
 
 GROQ_API_KEY=
 OPENAI_API_KEY=
+
+# Whisper backend preference. auto = mlx if installed, else Groq, else OpenAI.
+# Allowed values: auto | mlx | groq | openai
+# WATCH_WHISPER=auto
 
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
@@ -119,6 +132,15 @@ def _have_api_key() -> tuple[bool, str | None]:
     if _read_env_key("OPENAI_API_KEY"):
         return True, "openai"
     return False, None
+
+
+def _is_apple_silicon() -> bool:
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+def _whisper_backend() -> str | None:
+    """The backend /watch would pick right now (mlx | groq | openai | None)."""
+    return resolve_backend()[0]
 
 
 def is_first_run() -> bool:
@@ -217,29 +239,32 @@ def _install_hint_windows(missing: list[str]) -> str:
 def _status() -> dict:
     """Structured preflight snapshot.
 
-    `status` describes the *ideal* state (a Whisper key is encouraged), so a
-    keyless install still reports `needs_key` on the very first run — that's
-    the agent's cue to encourage adding one.
+    `status` describes the *ideal* state (a Whisper backend is encouraged), so
+    an install with neither mlx-whisper nor a key still reports `needs_key` on
+    the very first run — that's the agent's cue to encourage one. Local
+    mlx-whisper counts as a backend: no key is needed when it is installed.
 
     `can_proceed` is the operational gate: /watch can run as long as the
-    binaries are present AND the user has either set a key or already finished
-    setup (consciously opting out of Whisper). A keyless user who completed
-    setup is NOT nagged on every call.
+    binaries are present AND the user has a Whisper backend or already
+    finished setup (consciously opting out of Whisper). A user who completed
+    setup without Whisper is NOT nagged on every call.
     """
     missing = _check_binaries()
-    has_key, backend = _have_api_key()
+    has_key, _ = _have_api_key()
+    backend = _whisper_backend()
+    has_backend = backend is not None
     setup_complete = not is_first_run()
 
-    if not missing and has_key:
+    if not missing and has_backend:
         status = "ready"
-    elif missing and not has_key:
+    elif missing and not has_backend:
         status = "needs_install_and_key"
     elif missing:
         status = "needs_install"
     else:
         status = "needs_key"
 
-    can_proceed = (not missing) and (has_key or setup_complete)
+    can_proceed = (not missing) and (has_backend or setup_complete)
 
     cfg = get_config()
     return {
@@ -250,6 +275,9 @@ def _status() -> dict:
         "missing_binaries": missing,
         "whisper_backend": backend,
         "has_api_key": has_key,
+        "has_mlx_whisper": mlx_available(),
+        "mlx_model_cached": mlx_available() and model_cached(),
+        "apple_silicon": _is_apple_silicon(),
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
         "platform": platform.system(),
@@ -265,7 +293,7 @@ def cmd_check() -> int:
 
     On a state that blocks /watch, print one actionable line to stderr:
       2 → binaries missing
-      3 → genuine first run with no API key (encourage one)
+      3 → genuine first run with no Whisper backend (encourage one)
       4 → both missing
     """
     s = _status()
@@ -275,8 +303,9 @@ def cmd_check() -> int:
     parts = []
     if s["missing_binaries"]:
         parts.append(f"missing binaries: {', '.join(s['missing_binaries'])}")
-    if not s["has_api_key"] and not s["setup_complete"]:
-        parts.append("no Whisper API key (GROQ_API_KEY or OPENAI_API_KEY)")
+    has_backend = s["whisper_backend"] is not None
+    if not has_backend and not s["setup_complete"]:
+        parts.append("no Whisper backend (mlx-whisper, GROQ_API_KEY or OPENAI_API_KEY)")
     installer = Path(__file__).resolve()
     sys.stderr.write(
         f"[watch] setup incomplete ({'; '.join(parts)}). "
@@ -284,7 +313,7 @@ def cmd_check() -> int:
     )
     sys.stderr.flush()
 
-    if s["missing_binaries"] and not s["has_api_key"]:
+    if s["missing_binaries"] and not has_backend:
         return 4
     if s["missing_binaries"]:
         return 2
@@ -331,23 +360,46 @@ def cmd_install() -> int:
     else:
         print(f"[setup] config exists: {CONFIG_FILE}")
 
-    has_key, backend = _have_api_key()
-    if has_key:
+    backend = _whisper_backend()
+    if backend:
         _write_setup_complete()
         print(f"[setup] ready. whisper backend: {backend}")
+        if backend == "mlx" and not model_cached():
+            print(f"[setup] first transcription downloads {MLX_MODEL} (~1.5 GB). "
+                  "Pre-fetch now with: python3 setup.py --warm")
         if installed_deps:
             print("[setup] installed dependencies; /watch is fully set up.")
         return 0
 
     print("")
-    print("[setup] one step left: add a Whisper API key.")
+    print("[setup] one step left: pick a Whisper backend.")
     print("")
-    print(f"  Edit {CONFIG_FILE} and set either:")
-    print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
+    print("  Local, Apple Silicon only (free, private, no key):")
+    print("    brew install pipx && pipx install mlx-whisper")
+    print(f"  Or edit {CONFIG_FILE} and set either:")
+    print("    GROQ_API_KEY=...    (preferred API — cheaper, faster; get one at console.groq.com/keys)")
     print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
     print("")
-    print("  Without a key, /watch still works but videos without captions come back frames-only.")
+    print("  Without a backend, /watch still works but videos without captions come back frames-only.")
     return 3
+
+
+def cmd_warm() -> int:
+    """Fetch the local model once so the first /watch isn't a silent 1.5 GB
+    download inside a tool timeout. No-op when already cached."""
+    if not mlx_available():
+        print("[setup] mlx_whisper is not installed — nothing to warm.", file=sys.stderr)
+        return 2
+    if model_cached():
+        print(f"[setup] {MLX_MODEL} already cached — verifying…", file=sys.stderr)
+    else:
+        print(f"[setup] downloading {MLX_MODEL} (~1.5 GB, one time)…", file=sys.stderr)
+    # Always run the CLI: an interrupted download leaves a folder that looks
+    # cached until the snapshot completes, and the CLI resumes it. ~2 s when warm.
+    with tempfile.TemporaryDirectory(prefix="watch-warm-") as tmp:
+        warm(Path(tmp))
+    print(f"[setup] {MLX_MODEL} ready.")
+    return 0
 
 
 def main() -> int:
@@ -357,6 +409,8 @@ def main() -> int:
             return cmd_check()
         if arg == "--json":
             return cmd_json()
+        if arg == "--warm":
+            return cmd_warm()
     return cmd_install()
 
 

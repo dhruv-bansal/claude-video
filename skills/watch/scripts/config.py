@@ -13,6 +13,11 @@ DEFAULT_DETAIL = "balanced"
 
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 
+# Whisper backend preference. "auto" = local mlx-whisper when installed, else
+# Groq, else OpenAI (whichever has a key).
+DEFAULT_WHISPER = "auto"
+WHISPER_BACKENDS = {"auto", "mlx", "groq", "openai"}
+
 
 def read_env_file(path: Path | None = None) -> dict[str, str]:
     if path is None:
@@ -56,8 +61,17 @@ def get_config() -> dict[str, object]:
     if detail not in DETAILS:
         detail = DEFAULT_DETAIL
 
+    whisper = (
+        os.environ.get("WATCH_WHISPER")
+        or file_values.get("WATCH_WHISPER")
+        or DEFAULT_WHISPER
+    ).lower()
+    if whisper not in WHISPER_BACKENDS:
+        whisper = DEFAULT_WHISPER
+
     return {
         "detail": detail,
+        "whisper": whisper,
         "config_file": str(CONFIG_FILE),
     }
 

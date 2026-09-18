@@ -1,7 +1,7 @@
 ---
 name: watch
 version: "0.2.0"
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
+description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper fallback — local mlx-whisper on Apple Silicon, else Groq/OpenAI API), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
 homepage: https://github.com/bradautomates/claude-video
@@ -13,7 +13,7 @@ user-invocable: true
 
 # /watch
 
-You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs (scene-aware, or fast keyframes at `efficient` detail), gets a timestamped transcript (native captions first, then Whisper API as fallback), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
+You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs (scene-aware, or fast keyframes at `efficient` detail), gets a timestamped transcript (native captions first, then Whisper as fallback — locally on the Apple Silicon GPU when `mlx_whisper` is installed, otherwise the Groq/OpenAI API), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
 
 ## Resolve `SKILL_DIR` (do this before any command)
 
@@ -48,14 +48,14 @@ python3 "${SKILL_DIR}/scripts/setup.py" --json
 
 Branch on two fields:
 
-- **`can_proceed: true` and `first_run: false`** → setup is already done (the user may have deliberately skipped a Whisper key — that's allowed). Proceed to Step 1 without comment.
+- **`can_proceed: true` and `first_run: false`** → setup is already done (the user may have deliberately skipped Whisper — that's allowed). Proceed to Step 1 without comment.
 - **`first_run: true`** → genuine first-time setup. Do these in order:
   1. If `missing_binaries` is non-empty, run the installer first (it auto-installs on macOS / prints commands elsewhere — see below) and confirm the binaries land. **Do not skip this and jump to preferences.**
   2. Run the installer once more if needed so it scaffolds `~/.config/watch/.env` (it only writes the template when the file is absent, so let it create the file *before* you write any values into it).
-  3. Encourage a Whisper API key and ask the watch-preference questions below, then write the selected values into `~/.config/watch/.env` and set `SETUP_COMPLETE=true`.
+  3. Encourage a Whisper backend (see below) and ask the watch-preference questions, then write the selected values into `~/.config/watch/.env` and set `SETUP_COMPLETE=true`.
 - **`can_proceed: false` and `first_run: false`** → setup was finished before but the environment regressed (e.g. `missing_binaries` after an OS change). Run the installer to remediate, then proceed. Don't re-ask preferences.
 
-A missing Whisper key is *encouraged to fix, not required*: on a genuine first run `status` will read `needs_key` even when binaries are present — that's your cue to encourage a key, not a blocker.
+A missing Whisper backend is *encouraged to fix, not required*: on a genuine first run `status` will read `needs_key` when binaries are present but neither `mlx_whisper` nor an API key is — that's your cue to encourage one, not a blocker. When `has_mlx_whisper: true`, Whisper is already fully set up with no key (`whisper_backend: "mlx"`); do not ask for a key.
 
 On follow-up `/watch` calls in the same session, use the silent check:
 
@@ -70,10 +70,10 @@ On non-zero exit, follow the table:
 | Exit | Meaning | Action |
 |------|---------|--------|
 | `2` | Missing binaries (`ffmpeg` / `ffprobe` / `yt-dlp`) | Run installer |
-| `3` | Genuine first run with no Whisper API key | Run installer to scaffold `.env`, then encourage a key (the user may decline — proceed with `--no-whisper`) |
-| `4` | Both missing | Run installer, then encourage a key |
+| `3` | Genuine first run with no Whisper backend (no `mlx_whisper`, no API key) | Run installer to scaffold `.env`, then encourage a backend (the user may decline — proceed with `--no-whisper`) |
+| `4` | Both missing | Run installer, then encourage a backend |
 
-Exit `3` only fires before the user has completed setup. Once `SETUP_COMPLETE=true` is written, a keyless install returns exit 0 and is never nagged again.
+Exit `3` only fires before the user has completed setup. Once `SETUP_COMPLETE=true` is written, an install with no Whisper backend returns exit 0 and is never nagged again.
 
 The installer is idempotent — safe to re-run:
 
@@ -83,7 +83,21 @@ python3 "${SKILL_DIR}/scripts/setup.py"
 
 On macOS with Homebrew, it auto-installs `ffmpeg` and `yt-dlp`. On Linux/Windows, it prints the exact install commands for the user to run. It scaffolds `~/.config/watch/.env` with commented placeholders and default watch settings at `0600` perms.
 
-**If an API key is still missing after install:** use `AskUserQuestion` to ask the user whether they have a Groq API key (preferred — cheaper, faster) or an OpenAI key. Then write it into `~/.config/watch/.env` — set the matching `GROQ_API_KEY=...` or `OPENAI_API_KEY=...` line. If they don't want to set up Whisper, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
+**If no Whisper backend is available after install** (`whisper_backend: null` in `--json`), use `AskUserQuestion` to offer the choices — order them by what the machine supports:
+
+- **`apple_silicon: true`** → lead with the **local** option: `brew install pipx && pipx install mlx-whisper` (or `uv tool install mlx-whisper`). Free, no key, the audio never leaves the machine. If they accept, run the install for them (no sudo needed), then re-run `setup.py --json` and confirm `has_mlx_whisper: true` — the script finds the binary in `~/.local/bin` even before `pipx ensurepath` takes effect. Offer the API keys as the alternative.
+- **Otherwise** → ask whether they have a Groq API key (preferred — cheaper, faster) or an OpenAI key, and write it into `~/.config/watch/.env` as the matching `GROQ_API_KEY=...` or `OPENAI_API_KEY=...` line.
+- If they don't want to set up Whisper at all, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
+
+**First use of the local backend — pre-fetch the model.** When `--json` shows `has_mlx_whisper: true` and `mlx_model_cached: false`, the first transcription would download the ~1.5 GB `whisper-large-v3-turbo` weights *inside* the watch run, silently, and a default tool timeout kills it. Instead, run this once, with a long timeout (10 minutes) or in the background, and tell the user it is a one-time download:
+
+```bash
+python3 "${SKILL_DIR}/scripts/setup.py" --warm
+```
+
+It is safe to re-run: with the model already cached it finishes in a couple of seconds, and it resumes an interrupted download.
+
+The user can pin a backend with `WATCH_WHISPER=mlx|groq|openai` in `~/.config/watch/.env` (default `auto` = `mlx` when installed, else Groq, else OpenAI). Only write this line if they express a preference.
 
 **First-run watch preference:** after the installer has scaffolded `~/.config/watch/.env`, use `AskUserQuestion` to ask one question:
 
@@ -99,9 +113,9 @@ Write the answer directly into `~/.config/watch/.env` by setting the bare key on
 WATCH_DETAIL=balanced
 ```
 
-Use the user's selected value. If they skip the question, keep the recommended default. Once dependencies, the API-key choice, and this preference are handled, write or update `SETUP_COMPLETE=true` in the same file. Do not ask this preference question again when `SETUP_COMPLETE=true`.
+Use the user's selected value. If they skip the question, keep the recommended default. Once dependencies, the Whisper-backend choice, and this preference are handled, write or update `SETUP_COMPLETE=true` in the same file. Do not ask this preference question again when `SETUP_COMPLETE=true`.
 
-**Structured mode (optional):** `python3 "${SKILL_DIR}/scripts/setup.py" --json` emits `{status, can_proceed, first_run, setup_complete, missing_binaries, whisper_backend, has_api_key, config_file, watch_detail, platform}` where `status` is one of `ready | needs_install | needs_key | needs_install_and_key`. `status` describes the *ideal* state (a key is encouraged, so a keyless first run reads `needs_key`); `can_proceed` is the operational gate (binaries present AND a key is set OR setup was already completed). Branch on `can_proceed`/`first_run` to decide whether to run; use `status` to decide what to encourage.
+**Structured mode (optional):** `python3 "${SKILL_DIR}/scripts/setup.py" --json` emits `{status, can_proceed, first_run, setup_complete, missing_binaries, whisper_backend, has_api_key, has_mlx_whisper, mlx_model_cached, apple_silicon, config_file, watch_detail, platform}` where `status` is one of `ready | needs_install | needs_key | needs_install_and_key` and `whisper_backend` is `mlx | groq | openai | null` (what a run would use right now). `status` describes the *ideal* state (a backend is encouraged, so a first run with none reads `needs_key`); `can_proceed` is the operational gate (binaries present AND a backend is available OR setup was already completed). Branch on `can_proceed`/`first_run` to decide whether to run; use `status` to decide what to encourage.
 
 Within a single session, you can skip Step 0 on follow-up `/watch` calls — once `--check` returned 0, nothing about the environment changes between turns.
 
@@ -133,7 +147,7 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 
 **Step 1 — parse the user input.** Separate the video source (URL or path) from any question the user asked. Example: `/watch https://youtu.be/abc what language is this in?` → source = `https://youtu.be/abc`, question = `what language is this in?`.
 
-**Step 2 — run the watch script.** Pass the source verbatim. Do not shell-escape it yourself beyond normal quoting:
+**Step 2 — run the watch script.** Pass the source verbatim. Do not shell-escape it yourself beyond normal quoting. **Set a long tool timeout when Whisper will run** (no captions: any local file, and many short-form URLs): the local `mlx` backend transcribes at roughly 10-20× real time, so a 30-minute recording needs 2-3 minutes — beyond the default 2-minute Bash timeout. Use a 10-minute timeout, or run in the background for anything over ~45 minutes.
 
 ```bash
 python3 "${SKILL_DIR}/scripts/watch.py" "<source>"
@@ -147,9 +161,9 @@ Optional flags:
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
+- `--whisper mlx|groq|openai` — force a specific Whisper backend (default: `WATCH_WHISPER` from `.env`, else `auto` = local `mlx` when installed, then Groq, then OpenAI)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
-- `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
+- `--no-dedup` — keep near-duplicate frames. By default a tiled frame-delta pass drops frames where *no region* changed versus the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. A change confined to one region — a new bullet, a code diff, a dialog — is kept. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 
 ### Focusing on a section (higher frame rate)
 
@@ -184,7 +198,9 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 **Step 4 — answer the user.** You now have two streams of evidence:
 - **Frames** — what's on screen at each timestamp
-- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
+- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (mlx)` = transcribed locally on this machine; `whisper (groq)` or `whisper (openai)` = transcribed by API).
+
+If the report contains a **"transcript verification failed"** warning block, repeat it to the user in plain words: Whisper produced a repetition loop in the listed windows, and the speech there was lost. Do not answer questions about those windows from the transcript alone — use the frames, and offer a re-run (`--whisper` with a different backend, or `--start/--end` around the window). A **"Note: no speech was recognised in the last Ns"** line is advisory — look at the frames for that span; only mention it if someone is visibly speaking there.
 
 If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
 
@@ -223,16 +239,23 @@ Behavior:
 The script gets a timestamped transcript in one of two ways:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
-2. **Whisper API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
-   - **Groq** — `whisper-large-v3`. Preferred default: cheaper, faster. Get a key at console.groq.com/keys.
-   - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+2. **Whisper fallback.** If no captions came back (or the source is a local file), the script extracts mono 16 kHz audio with ffmpeg and transcribes it with the first available backend:
+   - **mlx** (local) — `mlx-community/whisper-large-v3-turbo` via the `mlx_whisper` CLI on the Apple Silicon GPU. No key, no upload, no per-minute cost; roughly real-time ÷ 10 on an M-series Mac. Install: `pipx install mlx-whisper`. Runs with `--condition-on-previous-text False --temperature 0.2`, the flags that stop Whisper's repetition-loop failure.
+   - **Groq** — `whisper-large-v3`. Preferred API: cheaper, faster. Audio (~0.5 MB/min mp3) is uploaded. Get a key at console.groq.com/keys.
+   - **OpenAI** — `whisper-1`. API fallback. Get a key at platform.openai.com/api-keys.
 
-Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
+Keys and the `WATCH_WHISPER` preference live in `~/.config/watch/.env`. Default order is mlx → Groq → OpenAI; override with `--whisper <backend>` for one run or `WATCH_WHISPER=<backend>` permanently. Use `--no-whisper` to skip the fallback entirely.
+
+**Every Whisper transcript is verified** before it is trusted. Whisper's failures are silent — it can emit the same phrase for minutes while discarding the real speech (a decoder loop), and the result reads fluently. The script scans for runs of ≥3 identical consecutive segments; on the `mlx` backend, looped windows are automatically re-transcribed in isolation at a higher temperature and spliced back in. Anything still looping is printed as a `> **Warning: transcript verification failed**` block in the report listing the affected windows — surface it to the user (see Step 4). Separately, a transcript that ends >30 s before the audio does gets a `> **Note:**` — that is usually outro music or silence, not lost speech; check the frames for that span rather than warning the user.
+
+When `auto` selected `mlx` and it fails at runtime (broken install, interrupted model download), the script falls back to a configured API key on its own and says so on stderr; the report header then shows `whisper (groq)` / `whisper (openai)`.
 
 ## Failure modes and handling
 
-- **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
-- **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
+- **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For the Whisper backend, ask the user via `AskUserQuestion` (local `mlx-whisper` on Apple Silicon, or an API key written to `~/.config/watch/.env`).
+- **No transcript available** → captions missing AND (no Whisper backend OR Whisper failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
+- **Transcript verification warning in the report** → Whisper looped in the listed windows. Tell the user; don't rely on the transcript for those windows. Re-run with a different `--whisper` backend, or focus on the window with `--start/--end`.
+- **`mlx_whisper` fails** → its stderr is printed (common: first-run model download interrupted, or not Apple Silicon). Re-run, or fall back with `--whisper groq|openai` if a key is set.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
@@ -251,18 +274,19 @@ If you already watched a video this session and the user asks a follow-up, do **
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
-- Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
-- Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
+- Runs `mlx_whisper` locally (Apple Silicon GPU) when it is installed and selected — the audio never leaves the machine. The first run downloads the ~1.5 GB `whisper-large-v3-turbo` weights from Hugging Face into `~/.cache/huggingface/hub/`
+- Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when Groq is the selected backend and `GROQ_API_KEY` is set
+- Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when OpenAI is the selected backend and `OPENAI_API_KEY` is set
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
-- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
+- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s), the `WATCH_WHISPER` / `WATCH_DETAIL` preferences, and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 
 **What this skill does NOT do:**
-- Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
+- Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND an API backend (not `mlx`) is selected AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting) — yt-dlp only ever requests public data
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
+- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`; the `mlx` backend uses no key)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
-- Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
+- Does not persist anything outside the working directory, `~/.config/watch/.env`, and (mlx only) the Hugging Face model cache — clean up the working directory when you're done (Step 5)
 
-**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
+**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction + tiled dedup), `scripts/transcribe.py` (caption parsing), `scripts/whisper.py` (backend selection, Groq / OpenAI clients), `scripts/local_whisper.py` (mlx_whisper runner + loop repair), `scripts/verify.py` (transcript verification), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.

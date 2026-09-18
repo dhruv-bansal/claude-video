@@ -6,7 +6,7 @@ Agent Skills package that gives an agent a video input. Installable across Claud
 
 - `skills/watch/SKILL.md` — canonical skill contract the model reads when `/watch` fires. Source of truth for behavior across every host.
 - `skills/watch/scripts/watch.py` — entry point; orchestrates download → frames → transcript.
-- `skills/watch/scripts/{download,frames,transcribe,whisper,setup,config}.py` — yt-dlp wrapper, ffmpeg frame extraction + auto-fps, caption/Whisper transcription, preflight/installer, shared config.
+- `skills/watch/scripts/{download,frames,transcribe,whisper,local_whisper,verify,setup,config}.py` — yt-dlp wrapper, ffmpeg frame extraction + auto-fps + tiled dedup, caption parsing, Whisper backend selection + Groq/OpenAI clients, local `mlx_whisper` runner, transcript verification, preflight/installer, shared config.
 - `skills/watch/scripts/build-skill.sh` — builds `dist/watch.skill` for claude.ai upload (dev-only).
 - `hooks/` — Claude Code SessionStart setup-status hook (Claude Code only).
 - `.claude-plugin/` — `plugin.json` + `marketplace.json` (Claude Code plugin + local marketplace).
@@ -48,3 +48,5 @@ bash skills/watch/scripts/build-skill.sh   # → dist/watch.skill
 - Keep the version in sync across `skills/watch/SKILL.md` (frontmatter), `.claude-plugin/plugin.json`, and `.codex-plugin/plugin.json` when cutting a release.
 - Releasing: tag `vX.Y.Z` and push the tag; `.github/workflows/release.yml` builds `dist/watch.skill` and attaches it to the GitHub release.
 - Never commit real API keys or `.env` contents; keys live in `~/.config/watch/.env` (mode `0600`) at runtime.
+- Whisper backend order is `auto` = local `mlx` when `mlx_whisper` is on PATH → Groq → OpenAI. Local-backend and verification code lives in `local_whisper.py` / `verify.py` so upstream files carry only thin hooks (keeps rebases onto `bradautomates/claude-video` small). Tests must not depend on the developer's machine having `mlx_whisper`: `tests/test_setup.py` builds a shim PATH, `tests/test_whisper.py` / `test_local_whisper.py` monkeypatch `mlx_available` or install a fake CLI.
+- Frame dedup is per-tile (`DEDUP_GRID`), not whole-frame. Two slides on one template differ by a whole-frame mean of ~2/255, so a whole-frame threshold deletes decks — `tests/test_dedup.py::test_dedupe_perceptual_keeps_every_slide` guards this.

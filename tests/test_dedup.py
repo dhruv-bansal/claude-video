@@ -69,13 +69,60 @@ def test_dedupe_compares_against_last_kept_not_previous(tmp_path: Path):
 
 
 def test_dedupe_threshold_is_inclusive(tmp_path: Path):
-    """Delta exactly == threshold is treated as a duplicate (<=)."""
+    """Tile delta exactly == threshold is treated as a duplicate (<=)."""
     cands = _touch(tmp_path, 2)
     a = bytes([0, 0, 0, 0])
-    b = bytes([8, 0, 0, 0])  # mean abs diff == 2.0
+    b = bytes([2, 2, 2, 2])  # every 1-px tile differs by exactly 2.0
     survivors, dropped = frames._dedupe_by_deltas(cands, [a, b], threshold=2.0)
     assert dropped == 1
     assert len(survivors) == 1
+
+
+def test_dedupe_localized_change_survives(tmp_path: Path):
+    """The slide-deck case: one region changes, the whole-frame mean stays tiny.
+
+    Whole-frame mean here is 8/4 = 2.0 (would be dropped at threshold 2.0);
+    the tile that changed moved by 8, so tiled dedup keeps it.
+    """
+    cands = _touch(tmp_path, 2)
+    a = bytes([0, 0, 0, 0])
+    b = bytes([8, 0, 0, 0])
+    assert frames._frame_delta(a, b) == 2.0
+    survivors, dropped = frames._dedupe_by_deltas(cands, [a, b], threshold=2.0)
+    assert dropped == 0
+    assert len(survivors) == 2
+
+
+# --- _tile_delta: max per-tile mean, not the global mean ----------------------
+
+def test_tile_delta_identical_is_zero():
+    a = bytes([7] * 64)
+    assert frames._tile_delta(a, a, grid=8) == 0.0
+
+
+def test_tile_delta_reports_worst_tile():
+    """64-px (8x8) thumb on a 2x2 grid → four 4x4 tiles. Only the top-left
+    tile changes (by 10 per pixel): tile mean 10, global mean 2.5."""
+    side = 8
+    a = bytes([0] * side * side)
+    b = bytearray(a)
+    for y in range(4):
+        for x in range(4):
+            b[y * side + x] = 10
+    b = bytes(b)
+    assert frames._frame_delta(a, b) == 2.5
+    assert frames._tile_delta(a, b, grid=2) == 10.0
+
+
+def test_tile_delta_grid_larger_than_thumb_uses_pixels():
+    a = bytes([0, 0, 0, 0])
+    b = bytes([0, 0, 0, 40])
+    assert frames._tile_delta(a, b, grid=8) == 40.0
+
+
+def test_tile_delta_non_square_or_mismatched_is_infinite():
+    assert frames._tile_delta(bytes([1, 2, 3]), bytes([1, 2, 3])) == float("inf")
+    assert frames._tile_delta(bytes([1, 2, 3, 4]), bytes([1, 2])) == float("inf")
 
 
 def test_dedupe_empty_and_single_are_noops(tmp_path: Path):
@@ -120,6 +167,26 @@ def test_dedupe_perceptual_keeps_distinct_cuts(cut_clip: Path, tmp_path: Path):
     survivors, dropped = frames.dedupe_perceptual(out)
     assert dropped == 0
     assert len(survivors) == n_before
+
+
+def test_dedupe_perceptual_keeps_every_slide(deck_clip: Path, tmp_path: Path):
+    """Regression: a deck whose slides differ by a whole-frame mean of ~2/255.
+
+    Uniform sampling at 2 fps over three 1s slides yields two frames per slide.
+    Dedup must collapse the within-slide repeats and keep one frame per slide
+    — the old whole-frame comparison dropped slide 2 and 3 as "duplicates".
+    """
+    out = frames.extract(str(deck_clip), tmp_path / "f", fps=2.0, max_frames=20)
+    thumbs = frames._thumb_frames([Path(fr["path"]) for fr in out])
+    # Prove the premise: each slide transition sits under the whole-frame
+    # threshold, i.e. whole-frame dedup would have called it a duplicate.
+    transitions = [frames._frame_delta(thumbs[i], thumbs[i + 1]) for i in (1, 3)]
+    assert all(d <= frames.DEDUP_THRESHOLD for d in transitions), transitions
+
+    survivors, dropped = frames.dedupe_perceptual(out)
+    assert len(survivors) == 3, [s["timestamp_seconds"] for s in survivors]
+    assert dropped == len(out) - 3
+    assert [round(s["timestamp_seconds"]) for s in survivors] == [0, 1, 2]
 
 
 # --- engine integration: dedup runs before the cap, reports deduped_count -----

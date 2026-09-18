@@ -69,6 +69,45 @@ def build_static_clip(
     ])
 
 
+def build_deck_clip(
+    path: Path,
+    n_slides: int = 3,
+    seg: float = 1.0,
+    size: str = "1280x720",
+    fps: int = 10,
+) -> None:
+    """A slide deck: white slides, each adding one dark "text line".
+
+    Consecutive slides differ by a whole-frame mean of ~2/255 — the same
+    signal a real deck on a shared template produces — which is exactly what
+    whole-frame dedup at threshold 2.0 collapsed. Tiled dedup must keep all.
+    """
+    w = int(size.split("x")[0])
+    inputs: list[str] = []
+    for i in range(n_slides):
+        boxes = "".join(
+            f",drawbox=x=100:y={100 + 60 * k}:w={w // 5}:h=24:c=black:t=fill"
+            for k in range(i + 1)
+        )
+        inputs += ["-f", "lavfi", "-t", str(seg), "-i", f"color=c=white:s={size}:r={fps}{boxes}"]
+    streams = "".join(f"[{i}:v]" for i in range(n_slides))
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", f"{streams}concat=n={n_slides}:v=1:a=0[out]", "-map", "[out]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
+        str(path),
+    ])
+
+
+@pytest.fixture(scope="session")
+def deck_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "deck.mp4"
+    build_deck_clip(path)
+    return path
+
+
 @pytest.fixture(scope="session")
 def cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "cuts.mp4"
