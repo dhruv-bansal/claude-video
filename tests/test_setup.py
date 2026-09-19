@@ -37,6 +37,8 @@ def _run(args, *, home=None, extra_env=None, mlx=False):
     env.pop("GROQ_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)
     env.pop("SETUP_COMPLETE", None)
+    env.pop("HF_HOME", None)
+    env.pop("HF_HUB_CACHE", None)
     if home is not None:
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)  # Windows

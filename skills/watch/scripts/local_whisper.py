@@ -147,6 +147,30 @@ def slice_audio(full_audio: Path, out_path: Path, start: float, end: float) -> P
     return out_path
 
 
+def retry_window(segments: list[dict], loop: dict, duration_seconds: float) -> tuple[float, float]:
+    """The [lo, hi] span to re-transcribe for one loop.
+
+    Pad the loop, then widen to the full extent of every segment the padded
+    span overlaps. splice_segments drops overlapping segments whole, so the
+    retry must cover everything it removes or the words outside the pad
+    would be lost.
+    """
+    lo = max(0.0, loop["start"] - LOOP_RETRY_PAD_SECONDS)
+    hi = loop["end"] + LOOP_RETRY_PAD_SECONDS
+    while True:  # to a fixpoint: widening can pull in further overlapping segments
+        before = (lo, hi)
+        for seg in segments:
+            start, end = float(seg["start"]), float(seg["end"])
+            if end > lo and start < hi:
+                lo, hi = min(lo, start), max(hi, end)
+        if (lo, hi) == before:
+            break
+    lo = max(0.0, lo)
+    if duration_seconds:
+        hi = min(duration_seconds, hi)
+    return lo, hi
+
+
 def repair_loops(
     segments: list[dict],
     loops: list[dict],
@@ -164,10 +188,7 @@ def repair_loops(
     from whisper import shift_segments  # lazy: whisper imports this module
 
     for index, loop in enumerate(loops):
-        lo = max(0.0, loop["start"] - LOOP_RETRY_PAD_SECONDS)
-        hi = loop["end"] + LOOP_RETRY_PAD_SECONDS
-        if duration_seconds:
-            hi = min(duration_seconds, hi)
+        lo, hi = retry_window(segments, loop, duration_seconds)
         print(
             f"[watch] repetition loop {index + 1}/{len(loops)} at "
             f"{lo:.0f}s-{hi:.0f}s (×{loop['count']} {loop['text'][:40]!r}) — re-transcribing window…",

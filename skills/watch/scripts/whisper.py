@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Transcribe a video via Groq or OpenAI Whisper API.
+"""Transcribe a video with Whisper: local mlx-whisper, or the Groq / OpenAI API.
 
-Strategy: extract audio (mono 16kHz mp3, tiny payload), upload to whichever
-API has a key. Returns segments in the same shape as transcribe.parse_vtt so
-the rest of the pipeline (filter_range, format_transcript) doesn't care where
-the transcript came from.
+Strategy: pick a backend (resolve_backend: mlx when installed, else whichever
+API has a key), extract audio, transcribe, then verify the result for
+Whisper's silent failures (verify.py). The local path lives in
+local_whisper.py; this file holds backend selection and the API clients.
+Returns segments in the same shape as transcribe.parse_vtt so the rest of the
+pipeline (filter_range, format_transcript) doesn't care where the transcript
+came from.
 
 Pure stdlib — no `pip install groq` or `pip install openai` needed.
 """

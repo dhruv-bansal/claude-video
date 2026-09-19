@@ -48,7 +48,7 @@ python3 "${SKILL_DIR}/scripts/setup.py" --json
 
 Branch on two fields:
 
-- **`can_proceed: true` and `first_run: false`** → setup is already done (the user may have deliberately skipped Whisper — that's allowed). Proceed to Step 1 without comment.
+- **`can_proceed: true` and `first_run: false`** → setup is already done (the user may have deliberately skipped Whisper — that's allowed). Proceed to Step 1 without comment — **unless** `whisper_backend` is `"mlx"` and `mlx_model_cached` is `false`: then run `setup.py --warm` first (see "pre-fetch the model" below). This applies regardless of `first_run`; a user who installed `mlx_whisper` for another project has the CLI but not this model.
 - **`first_run: true`** → genuine first-time setup. Do these in order:
   1. If `missing_binaries` is non-empty, run the installer first (it auto-installs on macOS / prints commands elsewhere — see below) and confirm the binaries land. **Do not skip this and jump to preferences.**
   2. Run the installer once more if needed so it scaffolds `~/.config/watch/.env` (it only writes the template when the file is absent, so let it create the file *before* you write any values into it).

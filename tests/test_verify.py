@@ -76,10 +76,19 @@ class TestSpliceSegments:
         out = verify.splice_segments(segs, 10.0, 13.0, fixed)
         assert [s["text"] for s in out] == ["a", "good", "z"]
 
-    def test_window_bounds_are_inclusive_on_start(self):
-        segs = [_seg(0, 1, "a"), _seg(5, 6, "b"), _seg(9, 10, "c")]
+    def test_drops_segments_overlapping_the_window(self):
+        """A segment that merely touches the boundary (ends at lo / starts at hi) is kept."""
+        segs = [_seg(0, 5, "a"), _seg(5, 6, "b"), _seg(9, 10, "c")]
         out = verify.splice_segments(segs, 5.0, 9.0, [])
-        assert [s["text"] for s in out] == ["a"]
+        assert [s["text"] for s in out] == ["a", "c"]
+
+    def test_straddling_segment_is_replaced_whole(self):
+        """A segment overlapping the window is dropped in full — the caller
+        (local_whisper.retry_window) guarantees the retry covers its whole span."""
+        segs = [_seg(3, 7, "before loop"), _seg(10, 11, "x"), _seg(11, 12, "x"), _seg(12, 13, "x")]
+        redo = [_seg(3, 7, "before loop again"), _seg(10, 13, "real speech")]
+        out = verify.splice_segments(segs, 3.0, 18.0, redo)
+        assert [s["text"] for s in out] == ["before loop again", "real speech"]
 
 
 class TestFilterQualityRange:

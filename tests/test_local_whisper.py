@@ -197,3 +197,50 @@ class TestTranscribeVideoMlx:
 
         with pytest.raises(SystemExit, match="mlx_whisper failed"):  # pinned: no fallback
             whisper.transcribe_video("v.mp4", tmp_path / "audio.mp3", backend="mlx", api_key="")
+
+
+class TestRetryWindow:
+    def test_widens_to_cover_straddling_segments(self):
+        """Loop 10-13s → pad 5-18s. A good segment 3-7s straddles lo, and one
+        16-21s straddles hi; both are dropped whole by the splice, so the retry
+        window must grow to 3-21s or their outer words would be lost."""
+        segs = [_seg(3, 7, "a"), _seg(10, 11, "x"), _seg(11, 12, "x"), _seg(12, 13, "x"), _seg(16, 21, "z")]
+        loop = verify.find_repetition_runs(segs)[0]
+        assert local_whisper.retry_window(segs, loop, duration_seconds=60.0) == (3.0, 21.0)
+
+    def test_chained_overlaps_reach_fixpoint(self):
+        """1-3.5 overlaps 3-7 which overlaps the pad: the window must reach 1.0,
+        otherwise the splice drops 1-3.5 while the retry starts at 3.0."""
+        segs = [_seg(1, 3.5, "p"), _seg(3, 7, "q"), _seg(10, 11, "x"), _seg(11, 12, "x"), _seg(12, 13, "x")]
+        loop = verify.find_repetition_runs(segs)[0]
+        assert local_whisper.retry_window(segs, loop, duration_seconds=60.0) == (1.0, 18.0)
+
+    def test_clamps_to_audio_bounds(self):
+        segs = [_seg(0, 1, "x"), _seg(1, 2, "x"), _seg(2, 3, "x")]
+        loop = verify.find_repetition_runs(segs)[0]
+        assert local_whisper.retry_window(segs, loop, duration_seconds=6.0) == (0.0, 6.0)
+
+    def test_repair_keeps_words_before_pad(self, tmp_path: Path, monkeypatch):
+        """End to end with a fake CLI: the CLI must receive the widened window
+        and the pre-pad words must survive (re-emitted by the retry, not lost)."""
+        record = tmp_path / "argv.json"
+        # The fake returns 0-based segments for whatever window it is given;
+        # lo will be 3.0, so 0-4 → 3-7 source time reproduces "A B C D".
+        _fake_mlx(tmp_path / "bin", [{"start": 0.0, "end": 4.0, "text": "A B C D"},
+                                     {"start": 7.0, "end": 10.0, "text": "real speech"}], record)
+        monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+        audio = tmp_path / "audio.wav"
+        _make_wav(audio, 40.0)
+        segs = [_seg(3, 7, "A B C D")] + [_seg(10 + i, 11 + i, "Thank you.") for i in range(3)] + [_seg(30, 35, "outro")]
+        loops = verify.find_repetition_runs(segs)
+
+        out = local_whisper.repair_loops(segs, loops, audio, tmp_path / "mlx", duration_seconds=40.0)
+
+        assert [s["text"] for s in out] == ["A B C D", "real speech", "outro"]
+        assert out[0]["start"] == 3.0 and out[0]["end"] == 7.0
+        # ffmpeg sliced exactly the widened window (3.0 → 18.0)
+        wav = tmp_path / "mlx" / "loop_00.wav"
+        import subprocess as sp
+        dur = float(sp.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(wav)],
+                           capture_output=True, text=True).stdout.strip())
+        assert abs(dur - 15.0) < 0.1

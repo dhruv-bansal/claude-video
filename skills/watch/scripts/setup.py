@@ -390,6 +390,10 @@ def cmd_warm() -> int:
     if not mlx_available():
         print("[setup] mlx_whisper is not installed — nothing to warm.", file=sys.stderr)
         return 2
+    missing = _check_binaries()
+    if missing:
+        print(f"[setup] --warm needs {', '.join(missing)} — run the installer first.", file=sys.stderr)
+        return 2
     if model_cached():
         print(f"[setup] {MLX_MODEL} already cached — verifying…", file=sys.stderr)
     else:

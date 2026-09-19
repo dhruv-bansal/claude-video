@@ -258,9 +258,11 @@ def main() -> int:
             except SystemExit as exc:
                 print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
         else:
+            pinned = args.whisper or (config["whisper"] if config["whisper"] != "auto" else None)
             hint = (
-                f"--whisper {args.whisper} was set but it is unavailable (key missing, or mlx_whisper not installed)"
-                if args.whisper else
+                f"Whisper backend '{pinned}' is pinned ({'--whisper' if args.whisper else 'WATCH_WHISPER in ~/.config/watch/.env'}) "
+                "but unavailable (key missing, or mlx_whisper not installed)"
+                if pinned else
                 "no subtitles and no Whisper backend found (mlx_whisper, GROQ_API_KEY or OPENAI_API_KEY)"
             )
             setup_py = SCRIPT_DIR / "setup.py"

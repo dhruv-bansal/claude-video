@@ -99,12 +99,14 @@ def splice_segments(
     hi: float,
     replacement: list[dict],
 ) -> list[dict]:
-    """Replace every segment starting inside [lo, hi] with `replacement`.
+    """Replace every segment overlapping [lo, hi] with `replacement`.
 
-    `replacement` must already be in source time. The result stays
-    chronological.
+    Overlap, not start-inside: the window is padded, so a good segment that
+    starts before `lo` but runs into it would otherwise be kept *and* have its
+    tail re-emitted by the retry. `replacement` must already be in source
+    time. The result stays chronological.
     """
-    kept = [seg for seg in segments if not (lo <= float(seg["start"]) <= hi)]
+    kept = [seg for seg in segments if float(seg["end"]) <= lo or float(seg["start"]) >= hi]
     merged = kept + list(replacement)
     merged.sort(key=lambda seg: (float(seg["start"]), float(seg["end"])))
     return merged
