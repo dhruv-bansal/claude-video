@@ -14,14 +14,16 @@ from pathlib import Path
 
 from config import (CONFIG_DIR, CONFIG_FILE, ConfigError, DETAILS, ENGINES, get_config,
                     load_api_key, load_gemini_key, read_env_file, resolve_engine, write_settings)
+from local_whisper import MLX_MODEL, mlx_available, model_cached, warm
 from runtime import configure_stdio, diagnostic, run_text
 
 REQUIRED_BINARIES = ['ffmpeg', 'ffprobe', 'yt-dlp']
 WHISPERX_VERSION = '3.8.6'
 _PERM_WARNED: set[str] = set()
 ENV_TEMPLATE = '''# /watch configuration. No shell interpolation; last assignment wins.
-# Native captions always come first. Optional fallback: auto|whisperx|groq|openai|none.
-# auto preserves the Groq-then-OpenAI preference for existing installations.
+# Native captions always come first. Optional fallback: auto|mlx|whisperx|groq|openai|none.
+# auto = local mlx-whisper when installed (Apple Silicon: pipx install mlx-whisper;
+# free, nothing uploaded, no key), else Groq, then OpenAI. whisperx is explicit-only.
 # The first-run skill wizard sets WATCH_DETAIL and WATCH_WHISPER_BACKEND.
 # WATCH_ENGINE=auto|gemini|local. auto uses Gemini when GEMINI_API_KEY is set.
 # With the gemini engine, local videos are uploaded to Google for analysis.
@@ -54,6 +56,10 @@ def _check_file_permissions(path: Path) -> None:
 def _have_api_key():
     backend, key = load_api_key()
     return bool(key), backend
+
+
+def _is_apple_silicon():
+    return platform.system() == 'Darwin' and platform.machine() == 'arm64'
 
 
 def is_first_run():
@@ -153,9 +159,15 @@ def _status(detailed=False):
     binaries_required = engine == 'local'
     has_key, detected = _have_api_key()
     chosen = cfg['whisper_backend']
-    backend = detected if chosen == 'auto' else chosen
+    has_mlx = mlx_available()
+    backend = ('mlx' if has_mlx else detected) if chosen == 'auto' else chosen
     local_ready = _whisperx_status(cfg, detailed)
-    backend_ready = local_ready if chosen == 'whisperx' else (bool(load_api_key(backend)[1]) if backend in ('groq', 'openai') else chosen == 'none')
+    if chosen == 'whisperx':
+        backend_ready = local_ready
+    elif backend == 'mlx':
+        backend_ready = has_mlx
+    else:
+        backend_ready = bool(load_api_key(backend)[1]) if backend in ('groq', 'openai') else chosen == 'none'
     blocked = bool(missing) and binaries_required
     result = {'status': 'needs_install' if blocked else 'ready', 'can_proceed': not blocked,
               'engine': engine, 'configured_engine': cfg['engine'], 'gemini_key_present': gemini_key,
@@ -163,6 +175,8 @@ def _status(detailed=False):
               'first_run': is_first_run(), 'setup_complete': not is_first_run(),
               'missing_binaries': missing, 'whisper_backend': backend, 'configured_backend': chosen,
               'has_api_key': has_key, 'backend_ready': backend_ready,
+              'has_mlx_whisper': has_mlx, 'mlx_model_cached': has_mlx and model_cached(),
+              'apple_silicon': _is_apple_silicon(),
               'whisperx_ready': local_ready, 'whisperx_bin': cfg['whisperx_bin'],
               'whisperx_model': cfg['whisperx_model'], 'config_file': str(CONFIG_FILE),
               'watch_detail': cfg['detail'], 'platform': platform.system()}
@@ -231,8 +245,35 @@ def cmd_install(backend=None, detail=None, engine=None):
         if backend in ('groq', 'openai') and not load_api_key(backend)[1]:
             print(f'[setup] Base watch is ready. Add {backend.upper()}_API_KEY privately to {CONFIG_FILE}, then rerun --backend {backend}.', file=sys.stderr)
             return 3
+        if backend == 'mlx' and not mlx_available():
+            print('[setup] Base watch is ready. mlx-whisper runs on Apple Silicon only: '
+                  'brew install pipx && pipx install mlx-whisper, then rerun --backend mlx.', file=sys.stderr)
+            return 3
         _write_setup_complete()
+        if backend in ('mlx', 'auto') and mlx_available() and not model_cached():
+            print(f'[setup] The first local transcription downloads {MLX_MODEL} (~1.5 GB). '
+                  f'Pre-fetch it now with: python3 "{Path(__file__).resolve()}" --warm', file=sys.stderr)
     print(f'[setup] Base watch is ready. Configuration: {CONFIG_FILE}')
+    return 0
+
+
+def cmd_warm():
+    """Fetch the mlx model once so the first /watch isn't a silent 1.5 GB
+    download inside a tool timeout. Cheap (~2 s) when already cached."""
+    if not mlx_available():
+        print('[setup] mlx_whisper is not installed; nothing to warm. '
+              'Apple Silicon: brew install pipx && pipx install mlx-whisper', file=sys.stderr)
+        return 2
+    if not _which('ffmpeg'):
+        print('[setup] --warm needs ffmpeg; run the installer first.', file=sys.stderr)
+        return 2
+    state = 'already cached; verifying' if model_cached() else 'downloading (~1.5 GB, one time)'
+    print(f'[setup] {MLX_MODEL}: {state}…', file=sys.stderr, flush=True)
+    # Always run the CLI: an interrupted download leaves a folder that looks
+    # cached until the snapshot completes, and the CLI resumes it.
+    with tempfile.TemporaryDirectory(prefix='watch-warm-') as temporary:
+        warm(Path(temporary))
+    print(f'[setup] {MLX_MODEL} ready.')
     return 0
 
 
@@ -318,7 +359,8 @@ def main():
     mode.add_argument('--check', action='store_true')
     mode.add_argument('--json', action='store_true')
     mode.add_argument('--install-whisperx', action='store_true')
-    parser.add_argument('--backend', choices=['auto', 'whisperx', 'groq', 'openai', 'none'])
+    mode.add_argument('--warm', action='store_true', help='Pre-download the local mlx-whisper model (~1.5 GB, one time).')
+    parser.add_argument('--backend', choices=['auto', 'mlx', 'whisperx', 'groq', 'openai', 'none'])
     parser.add_argument('--detail', choices=sorted(DETAILS))
     parser.add_argument('--engine', choices=sorted(ENGINES))
     args = parser.parse_args()
@@ -327,6 +369,8 @@ def main():
             return cmd_check()
         if args.json:
             return cmd_json()
+        if args.warm:
+            return cmd_warm()
         return cmd_install('whisperx' if args.install_whisperx else args.backend, args.detail, args.engine)
     except (ConfigError, OSError, ValueError) as exc:
         print(f'[setup] {exc}', file=sys.stderr)

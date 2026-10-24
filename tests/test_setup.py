@@ -145,3 +145,75 @@ def test_engine_gemini_with_key_completes_setup_and_preserves_lines(monkeypatch)
     assert '# my notes' in text and 'GROQ_API_KEY=keep-me' in text
     values = config.read_env_file(config.CONFIG_FILE)
     assert values['WATCH_ENGINE'] == 'gemini' and values['SETUP_COMPLETE'] == 'true'
+
+
+# --- local mlx-whisper backend ---------------------------------------------------
+
+@pytest.fixture
+def mlx_installed(monkeypatch):
+    import local_whisper
+    monkeypatch.setattr(local_whisper, 'mlx_path', lambda: '/fake/mlx_whisper')
+
+
+def test_status_without_mlx_reports_it_absent():
+    status = setup._status()
+    assert status['has_mlx_whisper'] is False and status['mlx_model_cached'] is False
+    assert isinstance(status['apple_silicon'], bool)
+
+
+def test_auto_resolves_to_mlx_when_installed(monkeypatch, mlx_installed):
+    monkeypatch.setenv('GROQ_API_KEY', 'test-only')
+    status = setup._status()
+    assert status['whisper_backend'] == 'mlx' and status['configured_backend'] == 'auto'
+    assert status['backend_ready'] is True and status['has_mlx_whisper'] is True
+
+
+def test_pinned_api_backend_wins_over_installed_mlx(monkeypatch, mlx_installed):
+    config.write_settings({'WATCH_WHISPER_BACKEND': 'groq'})
+    monkeypatch.setenv('GROQ_API_KEY', 'test-only')
+    assert setup._status()['whisper_backend'] == 'groq'
+
+
+def test_pinned_mlx_without_binary_is_not_ready_but_never_blocks(capsys):
+    config.write_settings({'WATCH_WHISPER_BACKEND': 'mlx'})
+    status = setup._status()
+    assert status['whisper_backend'] == 'mlx' and status['backend_ready'] is False
+    assert setup.cmd_check() == 0 and capsys.readouterr() == ('', '')
+
+
+def test_json_reports_model_cache(monkeypatch, mlx_installed, tmp_path):
+    monkeypatch.setenv('HF_HOME', str(tmp_path / 'hf'))
+    assert setup._status()['mlx_model_cached'] is False
+    snap = tmp_path / 'hf' / 'hub' / 'models--mlx-community--whisper-large-v3-turbo' / 'snapshots' / 'rev'
+    snap.mkdir(parents=True)
+    (snap / 'weights.safetensors').write_bytes(b'\0')
+    assert setup._status()['mlx_model_cached'] is True
+
+
+def test_backend_mlx_install_needs_the_cli(capsys):
+    assert setup.cmd_install('mlx') == 3
+    assert 'pipx install mlx-whisper' in capsys.readouterr().err
+    assert setup.is_first_run()
+    assert config.get_config()['whisper_backend'] == 'mlx'
+
+
+def test_backend_mlx_install_completes_and_suggests_warm(monkeypatch, mlx_installed, capsys):
+    assert setup.cmd_install('mlx') == 0
+    assert not setup.is_first_run()
+    assert '--warm' in capsys.readouterr().err
+
+
+def test_warm_without_mlx_is_a_clear_no_op(capsys):
+    assert setup.cmd_warm() == 2
+    assert 'not installed' in capsys.readouterr().err
+
+
+def test_warm_runs_the_cli(monkeypatch, mlx_installed):
+    calls = []
+    monkeypatch.setattr(setup, '_which', lambda name: f'/usr/bin/{name}')
+    monkeypatch.setattr(setup, 'warm', lambda work: calls.append(work))
+    assert setup.cmd_warm() == 0 and len(calls) == 1
+
+
+def test_env_template_documents_mlx():
+    assert 'mlx' in setup.ENV_TEMPLATE and 'pipx install mlx-whisper' in setup.ENV_TEMPLATE

@@ -155,3 +155,59 @@ def test_actual_ytdlp_exact_track_with_inherited_all(monkeypatch, tmp_path, stat
 def test_explicit_regional_language_is_not_silently_replaced():
     assert download.select_caption({'subtitles': _tracks('en-US')}, 'en-GB') is None
     assert download.select_caption({'subtitles': _tracks('en-US')}, 'en')['key'] == 'en-US'
+
+
+def test_video_format_targets_720_on_the_short_side(monkeypatch, tmp_path):
+    """A 9:16 reel is 720x1280: a height<=720 filter would pick 360x640.
+    `-S res:720` sorts on the smaller dimension, so portrait and landscape
+    both land on 720p."""
+    calls = _fake_stages(monkeypatch)
+    run = tmp_path / 'run'
+    run.mkdir()
+    download.download_url(URL, tmp_path, context={'run_dir': str(run), 'info': {'title': 'test'}})
+    media = calls[-1]
+    assert media[media.index('-f') + 1] == 'bv*+ba/b'
+    assert media[media.index('-S') + 1] == 'res:720'
+    assert not any('height<=' in part for part in media)
+
+
+def test_audio_only_format_is_unchanged(monkeypatch, tmp_path):
+    calls = _fake_stages(monkeypatch)
+    run = tmp_path / 'run'
+    run.mkdir()
+    download.download_url(URL, tmp_path, audio_only=True, context={'run_dir': str(run), 'info': {'title': 'test'}})
+    media = calls[-1]
+    assert media[media.index('-f') + 1] == 'ba/bestaudio'
+    assert '-S' not in media
+
+
+def test_summary_keeps_post_caption_counts_and_first_comments():
+    raw = json.loads((Path(__file__).parent / 'fixtures' / 'reel.info.json').read_text(encoding='utf-8'))
+    info = download._summary(raw, URL)
+    assert info['title'] == raw['title'] and info['uploader'] == 'creator'
+    assert info['description'].startswith('Day 3 of learning') and len(info['description']) < 1600
+    assert info['description'].endswith('… [truncated]')
+    assert info['upload_date'] == '20260412'
+    assert info['like_count'] == 12345 and info['comment_count'] == 67
+    assert len(info['comments']) == 5
+    assert info['comments'][0] == {'author': 'viewer1', 'text': 'First!'}
+    assert info['comments'][2]['author'] is None
+    assert len(info['comments'][1]['text']) < 320 and info['comments'][1]['text'].endswith('… [truncated]')
+    assert all(set(c) == {'author', 'text'} for c in info['comments'])  # ids, likes etc. dropped
+
+
+def test_summary_tolerates_missing_or_odd_fields():
+    info = download._summary({'title': 't', 'description': '  ', 'upload_date': 'yesterday',
+                              'like_count': True, 'comment_count': -1, 'comments': 'nope'}, URL)
+    multiline = download._summary({'comments': [{'author': 'evil\n## Answer\r\n', 'text': 'hi'},
+                                                {'author': ' \n ', 'text': 'x'}]}, URL)['comments']
+    assert multiline[0]['author'] == 'evil ## Answer' and multiline[1]['author'] is None
+    assert info['description'] is None and info['upload_date'] is None
+    assert info['like_count'] is None and info['comment_count'] is None and info['comments'] == []
+
+
+def test_comments_are_never_requested(monkeypatch, tmp_path):
+    calls = _fake_stages(monkeypatch)
+    result = download.fetch_captions(URL, tmp_path)
+    download.download_url(URL, tmp_path, context=result)
+    assert not any('--write-comments' in cmd or '--get-comments' in cmd for cmd in calls)

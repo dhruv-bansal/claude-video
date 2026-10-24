@@ -2,6 +2,22 @@
 
 All notable changes to `/watch` are documented here.
 
+## [Unreleased]
+
+### Added
+- **Local Whisper backend (`mlx`).** On Apple Silicon, watch transcribes with the `mlx_whisper` CLI (`pipx install mlx-whisper`; `whisper-large-v3-turbo` on the GPU): no API key, nothing uploaded, no per-minute cost. Found on PATH or in pipx's `~/.local/bin`. New `--whisper mlx`, `setup.py --backend mlx`, and `setup.py --warm`, which pre-fetches the ~1.5 GB model so the first run is not a silent download. `setup.py --json` reports `has_mlx_whisper`, `mlx_model_cached`, and `apple_silicon`. The report labels the source `whisper (mlx large-v3-turbo)`.
+- **Transcript verification.** Every Whisper result (mlx, WhisperX, Groq, OpenAI) is checked for silent failures: repetition loops (three or more identical consecutive segments), truncated segments (text ending in U+FFFD; for mlx also one cue spanning a whole ~30 s decode window, a rule not applied to WhisperX or the APIs because they legitimately return long segments), and an advisory early stop. With mlx, looped windows are re-transcribed in isolation and truncated windows as ~10 s slices (cuts snapped to pauses, overlapping decodes, words de-duplicated by timestamp), then spliced back and re-verified. Anything left is shown as a **Warning: transcript verification failed** block naming the time ranges, filtered to the focus range. New modules `scripts/local_whisper.py` and `scripts/verify.py`.
+- **Post caption in URL reports.** A `## Post caption` section carries the uploader's caption (truncated at 1,500 characters), the post date, like and comment counts, and up to five comments when yt-dlp's metadata already includes them (watch never requests comments).
+- The SessionStart hook suggests `pipx install mlx-whisper` on Apple Silicon Macs when setup needs attention and the CLI is missing.
+
+### Changed
+- **`auto` now prefers local mlx-whisper when it is installed**, then Groq, then OpenAI; WhisperX stays explicit-only. Set `WATCH_WHISPER_BACKEND=groq` to keep the previous behaviour. When `auto` picks mlx and it fails at runtime (broken pipx environment, interrupted model download), the run falls back to a Groq/OpenAI key if one exists; an explicit `mlx` never falls back.
+- **Frame dedup compares per tile, not whole-frame.** Two different slides on one template differ by only ~2/255 as a whole-frame mean, under the 2.0 threshold, so decks lost slides as "duplicates". Dedup now splits a 64×64 RGB thumbnail into an 8×8 grid and keeps a frame when any tile changes. Held frames still collapse; a slide gaining a bullet is kept.
+
+### Fixed
+- Vertical videos downloaded at 360×640. The `height<=720` format filter treats a 9:16 reel's long side as its height; downloads now use `bv*+ba/b` sorted by `res:720` (the smaller dimension), so portrait reels arrive at 720×1280 and landscape videos still at 720p.
+- Whisper segments cut off by the decoder's per-window token cap lost speech silently. Observed on a Hindi reel: one segment 0–30 s ending in U+FFFD, with the speech from about 16–30 s missing. These segments are now flagged and, with mlx, re-transcribed in shorter slices.
+
 ## [0.3.2] — 2026-09-25
 
 ### Changed

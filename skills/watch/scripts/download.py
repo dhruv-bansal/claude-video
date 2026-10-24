@@ -12,6 +12,16 @@ from urllib.parse import urlparse
 from runtime import configure_stdio, diagnostic, run_text
 
 VIDEO_EXTS = {'.mp4', '.mkv', '.webm', '.mov', '.m4v', '.avi', '.flv', '.wmv'}
+# Post text is useful context (a reel's caption often carries the point) but is
+# uploader-controlled and unbounded; keep enough to read, never a wall.
+DESCRIPTION_LIMIT = 1500
+COMMENT_LIMIT = 300
+MAX_COMMENTS = 5
+# yt-dlp's `res` sort field is the *smaller* dimension, so this targets 720p
+# for landscape (1280x720) and portrait (720x1280) alike. A `height<=720`
+# filter would cap a 9:16 reel at 360x640, because height is its long side.
+VIDEO_FORMAT = 'bv*+ba/b'
+VIDEO_SORT = 'res:720'
 
 
 def is_url(source: str) -> bool:
@@ -88,9 +98,39 @@ def _read_metadata(path: Path) -> dict:
         raise SystemExit(f'yt-dlp metadata unavailable or invalid: {type(exc).__name__}') from None
 
 
+def _clip(value, limit: int) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    return value if len(value) <= limit else value[:limit].rstrip() + ' … [truncated]'
+
+
+def _count(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _comments(raw) -> list[dict]:
+    """First comments yt-dlp already put in info.json (we never request more)."""
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        text = _clip(item.get('text'), COMMENT_LIMIT) if isinstance(item, dict) else None
+        if text:
+            author = item.get('author')
+            author = ' '.join(author.split())[:100] if isinstance(author, str) else ''
+            out.append({'author': author or None, 'text': text})
+        if len(out) == MAX_COMMENTS:
+            break
+    return out
+
+
 def _summary(raw: dict, url: str) -> dict:
+    upload_date = raw.get('upload_date')
     return {'title': raw.get('title'), 'uploader': raw.get('uploader') or raw.get('channel'),
-            'duration': raw.get('duration'), 'url': raw.get('webpage_url') or url}
+            'duration': raw.get('duration'), 'url': raw.get('webpage_url') or url,
+            'description': _clip(raw.get('description'), DESCRIPTION_LIMIT),
+            'upload_date': upload_date if isinstance(upload_date, str) and re.fullmatch(r'\d{8}', upload_date) else None,
+            'like_count': _count(raw.get('like_count')), 'comment_count': _count(raw.get('comment_count')),
+            'comments': _comments(raw.get('comments'))}
 
 
 def select_caption(info: dict, language: str = 'auto') -> dict | None:
@@ -169,8 +209,8 @@ def download_url(url: str, out_dir: Path, audio_only: bool = False, *, context=N
     run = Path(context['run_dir']) if context.get('run_dir') else _new_run(out_dir)
     record = run / 'final-path.jsonl'
     record.unlink(missing_ok=True)
-    fmt = 'ba/bestaudio' if audio_only else 'bv*[height<=720]+ba/b[height<=720]/bv+ba/b'
-    cmd = [*_common(run, auth), '-N', '8', '-f', fmt, '--merge-output-format', 'mp4',
+    fmt = ['-f', 'ba/bestaudio'] if audio_only else ['-f', VIDEO_FORMAT, '-S', VIDEO_SORT]
+    cmd = [*_common(run, auth), '-N', '8', *fmt, '--merge-output-format', 'mp4',
            '--no-ignore-errors', '--no-write-subs', '--no-write-auto-subs', '--write-info-json',
            '--print-to-file', 'after_move:%(filepath)j', str(record).replace('%', '%%')]
     if context.get('info_path'):

@@ -12,6 +12,11 @@ import pytest
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import local_whisper  # noqa: E402
+
+# The real lookup, captured before any test hides the developer's mlx_whisper.
+REAL_MLX_PATH = local_whisper.mlx_path
+
 
 @pytest.fixture(autouse=True)
 def isolated_user(monkeypatch, tmp_path):
@@ -44,6 +49,16 @@ def isolated_user(monkeypatch, tmp_path):
     def no_gemini(*args, **kwargs):
         raise AssertionError("Tests must mock Gemini calls")
     monkeypatch.setattr(gemini, "urlopen", no_gemini)
+    # A developer's real mlx_whisper must not change `auto` resolution in tests.
+    monkeypatch.setattr(local_whisper, "mlx_path", lambda: None)
+
+
+@pytest.fixture
+def real_mlx_lookup(monkeypatch, tmp_path):
+    """Restore the real PATH / pipx lookup (pointed at an empty pipx dir), for
+    tests that install a fake `mlx_whisper` on PATH."""
+    monkeypatch.setattr(local_whisper, "mlx_path", REAL_MLX_PATH)
+    monkeypatch.setattr(local_whisper, "PIPX_BIN_DIR", tmp_path / "no-pipx")
 
 # 14 visually distinct fills → 14 abrupt cuts → x264 emits a keyframe per cut.
 COLORS = [
@@ -101,6 +116,45 @@ def build_static_clip(
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "600",
         str(path),
     ])
+
+
+def build_deck_clip(
+    path: Path,
+    n_slides: int = 3,
+    seg: float = 1.0,
+    size: str = "1280x720",
+    fps: int = 10,
+) -> None:
+    """A slide deck: white slides, each adding one dark "text line".
+
+    Consecutive slides differ by a whole-frame mean of ~2/255, the same
+    signal a real deck on a shared template produces, which is exactly what
+    whole-frame dedup at threshold 2.0 collapsed. Tiled dedup must keep all.
+    """
+    w = int(size.split("x")[0])
+    inputs: list[str] = []
+    for i in range(n_slides):
+        boxes = "".join(
+            f",drawbox=x=100:y={100 + 60 * k}:w={w // 5}:h=24:c=black:t=fill"
+            for k in range(i + 1)
+        )
+        inputs += ["-f", "lavfi", "-t", str(seg), "-i", f"color=c=white:s={size}:r={fps}{boxes}"]
+    streams = "".join(f"[{i}:v]" for i in range(n_slides))
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", f"{streams}concat=n={n_slides}:v=1:a=0[out]", "-map", "[out]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
+        str(path),
+    ])
+
+
+@pytest.fixture(scope="session")
+def deck_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "deck.mp4"
+    build_deck_clip(path)
+    return path
 
 
 @pytest.fixture(scope="session")

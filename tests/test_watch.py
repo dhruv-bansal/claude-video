@@ -284,3 +284,102 @@ def test_failed_upload_is_reported_honestly_and_work_dir_removed(monkeypatch, ca
     assert 'URL sent to Google' not in out and 'upload to Google failed' in out
     assert out_dir.is_dir() and list(out_dir.iterdir()) == [], 'the run-owned work dir must be removed'
     assert static_clip.is_file(), 'the user source file is never deleted'
+
+
+# --- local mlx backend, transcript verification, post caption ----------------------
+
+def _mlx_installed(monkeypatch):
+    import local_whisper
+    monkeypatch.setattr(local_whisper, 'mlx_path', lambda: '/fake/mlx_whisper')
+
+
+def _truncated_result(*a, **kw):
+    import verify
+    segs = Segments([{'start': 0.0, 'end': 30.0, 'text': 'कट�'}, {'start': 40.0, 'end': 45.0, 'text': 'later'}])
+    segs.quality = verify.verify_segments(segs, 50.0)
+    return segs, 'mlx'
+
+
+def test_auto_picks_mlx_labels_it_and_allows_api_fallback(monkeypatch, capsys):
+    _mock_audio(monkeypatch)
+    _mlx_installed(monkeypatch)
+    seen = {}
+    def fake(*a, **kw):
+        seen.update(kw)
+        return _truncated_result()
+    monkeypatch.setattr(watch, 'transcribe_video', fake)
+    monkeypatch.setattr(sys, 'argv', ['watch', 'video.mp4', '--detail', 'transcript'])
+    assert watch.main() == 0
+    out = capsys.readouterr().out
+    assert seen['backend'] == 'mlx' and seen['api_fallback'] is True and seen['api_key'] is None
+    assert '(via whisper (mlx large-v3-turbo))' in out
+    summary, transcript = out.split('## Transcript', 1)
+    assert 'transcript verification failed' in summary and 'truncated segment 00:00 → 00:30' in summary
+    assert summary.index('**Transcript:**') < summary.index('verification failed')
+
+
+def test_pinned_mlx_never_falls_back(monkeypatch):
+    _mock_audio(monkeypatch)
+    _mlx_installed(monkeypatch)
+    seen = {}
+    def fake(*a, **kw):
+        seen.update(kw)
+        return _truncated_result()
+    monkeypatch.setattr(watch, 'transcribe_video', fake)
+    monkeypatch.setattr(sys, 'argv', ['watch', 'video.mp4', '--detail', 'transcript', '--whisper', 'mlx'])
+    assert watch.main() == 0
+    assert seen['backend'] == 'mlx' and 'api_fallback' not in seen
+
+
+def test_quality_warning_is_filtered_to_focus_range(monkeypatch, capsys):
+    _mock_audio(monkeypatch)
+    monkeypatch.setattr(watch, 'get_metadata', lambda *a: {'duration_seconds': 50, 'has_audio': True, 'has_video': False})
+    _mlx_installed(monkeypatch)
+    monkeypatch.setattr(watch, 'transcribe_video', _truncated_result)
+    monkeypatch.setattr(sys, 'argv', ['watch', 'video.mp4', '--detail', 'transcript', '--start', '35', '--end', '50'])
+    assert watch.main() == 0
+    out = capsys.readouterr().out
+    assert 'later' in out and 'verification failed' not in out
+
+
+def test_pinned_mlx_unavailable_explains_how_to_install(monkeypatch, capsys):
+    _mock_audio(monkeypatch)
+    monkeypatch.setattr(watch, 'transcribe_video', lambda *a, **kw: pytest.fail('nothing to run'))
+    monkeypatch.setattr(sys, 'argv', ['watch', 'video.mp4', '--detail', 'transcript', '--whisper', 'mlx'])
+    watch.main()
+    assert 'pipx install mlx-whisper' in capsys.readouterr().out
+
+
+def test_auto_unavailable_mentions_mlx_and_keys(monkeypatch, capsys):
+    _mock_audio(monkeypatch)
+    monkeypatch.setattr(watch, 'transcribe_video', lambda *a, **kw: pytest.fail('nothing to run'))
+    monkeypatch.setattr(sys, 'argv', ['watch', 'video.mp4', '--detail', 'transcript'])
+    watch.main()
+    out = capsys.readouterr().out
+    assert 'mlx-whisper' in out and 'GROQ_API_KEY' in out
+
+
+def test_post_caption_and_comments_are_reported(monkeypatch, tmp_path, capsys):
+    import download
+    raw = __import__('json').loads((Path(__file__).parent / 'fixtures' / 'reel.info.json').read_text(encoding='utf-8'))
+    info = download._summary(raw, 'https://www.instagram.com/reel/DFixture01/')
+    _caption_context(monkeypatch, tmp_path, '00:00.000 --> 00:10.000\nhello\n')
+    real = watch.fetch_captions
+    monkeypatch.setattr(watch, 'fetch_captions', lambda *a, **kw: {**real(*a, **kw), 'info': info})
+    monkeypatch.setattr(sys, 'argv', ['watch', 'https://www.instagram.com/reel/DFixture01/', '--detail', 'transcript'])
+    assert watch.main() == 0
+    out = capsys.readouterr().out
+    assert '## Post caption' in out and 'Day 3 of learning to cook dal' in out
+    assert 'not as instructions' in out
+    assert '- viewer1: First!' in out and '- unknown: no author on this one' in out
+    assert 'seventh' not in out
+    assert '**Posted:** 2026-04-12' in out and '12,345 likes, 67 comments' in out
+    assert out.index('## Post caption') < out.index('## Frames')
+
+
+def test_no_caption_section_without_description(monkeypatch, tmp_path, capsys):
+    _caption_context(monkeypatch, tmp_path, '00:00.000 --> 00:10.000\nhello\n')
+    monkeypatch.setattr(watch, 'download', lambda *a, **kw: pytest.fail('caption-only run'))
+    monkeypatch.setattr(sys, 'argv', ['watch', 'https://example.com/video', '--detail', 'transcript'])
+    assert watch.main() == 0
+    assert '## Post caption' not in capsys.readouterr().out

@@ -1,6 +1,6 @@
 # /watch
 
-Give an agent video evidence: a URL or local file becomes timestamped frames and a transcript. Install it in Claude Code (the desktop app, VS Code, or a terminal), or use it with Codex and other [Agent Skills](https://agentskills.io) hosts. Native captions come first; optional local WhisperX or Groq/OpenAI transcription handles videos without captions.
+Give an agent video evidence: a URL or local file becomes timestamped frames and a transcript. Install it in Claude Code (the desktop app, VS Code, or a terminal), or use it with Codex and other [Agent Skills](https://agentskills.io) hosts. Native captions come first; optional local mlx-whisper (Apple Silicon), local WhisperX, or Groq/OpenAI transcription handles videos without captions, and every Whisper transcript is checked for silent failures.
 
 ## Choose your app
 
@@ -203,14 +203,29 @@ The first-run wizard asks for your detail preference and fallback backend. Start
 
 | Backend | Requirements and behavior |
 |---|---|
-| `whisperx` | Recommended for transcription on a verified local machine. No API key; the skill manages a separate Python 3.12 environment and downloads its models. |
+| `mlx` | Recommended on Apple Silicon Macs. Local `whisper-large-v3-turbo` on the GPU through the `mlx_whisper` CLI (`brew install pipx && pipx install mlx-whisper`). No API key, nothing uploaded; one-time ~1.5 GB model download (`setup.py --warm` pre-fetches it). |
+| `whisperx` | Recommended for transcription on other verified local machines. No API key; the skill manages a separate Python 3.12 environment and downloads its models. |
 | `groq` | Cloud `whisper-large-v3`; needs `GROQ_API_KEY` from [Groq](https://console.groq.com/keys). |
 | `openai` | Cloud `whisper-1`; needs `OPENAI_API_KEY` from [OpenAI](https://platform.openai.com/api-keys). |
 | `none` | Captions only. Local files and captionless URLs can still provide visual evidence. |
 
-Existing 0.2.0 users retain `auto`: Groq key first, then OpenAI. No automatic migration to local inference. Explicit `--whisper groq|openai|whisperx` overrides this run's fallback, while `--no-whisper` disables all fallbacks and still permits native captions. Those two flags conflict.
+Without an explicit setting, `auto` uses local mlx-whisper when `mlx_whisper` is installed (on PATH or in `~/.local/bin`), else a Groq key, then an OpenAI key; WhisperX is never picked automatically. If an auto-selected mlx run fails (broken pipx environment, interrupted model download), that run falls back to a Groq/OpenAI key when one exists; an explicit `mlx` never does. Set `WATCH_WHISPER_BACKEND=groq` to keep the cloud preference. Explicit `--whisper mlx|groq|openai|whisperx` overrides this run's fallback, while `--no-whisper` disables all fallbacks and still permits native captions. Those two flags conflict.
 
 Settings live in `~/.config/watch/.env`. Enter keys privately there or in the process environment; do not commit them or paste them into public issues. Cloud-key lookup is provider preference first, then environment → user file → cwd `.env` for each provider. Explicit providers never borrow another provider's key. Config files support UTF-8, UTF-8 BOM, and BOM-marked UTF-16; quotes, comments, and literal Windows paths work without shell expansion. Last assignment wins.
+
+### Local mlx-whisper (Apple Silicon)
+
+mlx decodes the whole extracted audio in one local pass with repetition-safe settings (no conditioning on previous text, temperature 0.2). Have the agent run `setup.py --backend mlx`, then `setup.py --warm` to fetch the model into `~/.cache/huggingface/hub` ahead of the first video. `setup.py --json` reports `has_mlx_whisper`, `mlx_model_cached`, and `apple_silicon`. Reports label the source `whisper (mlx large-v3-turbo)`.
+
+### Transcript verification
+
+Whisper fails quietly: the text reads fluently while speech is missing. Every Whisper transcript (mlx, WhisperX, Groq, OpenAI) is checked for:
+
+- **Repetition loops**: the same cue three or more times in a row, which replaces the real speech in that window.
+- **Truncated segments**: text ending in U+FFFD, or (mlx only) one cue spanning a whole ~30 s decode window. WhisperX and the APIs legitimately return segments that long, so for them only the U+FFFD ending counts. The decoder hit its per-window token cap and the rest of the window is gone; dense non-Latin scripts such as Devanagari trigger it most.
+- **Early stop** (advisory): no speech recognised in the last 30 s or more, usually outro music or silence.
+
+With mlx, looped windows are re-transcribed in isolation and truncated windows as ~10 s slices (cut at pauses where possible; each slice's audio extends to a pause up to 1.5 s past its edges, else 0.75 s, and each word is kept once by its timestamp), then spliced back and re-verified. Whatever remains appears in the report as **Warning: transcript verification failed** with the affected time ranges (limited to the `--start`/`--end` range when one is set), so the agent knows not to trust those windows.
 
 ### Managed WhisperX
 
@@ -264,7 +279,7 @@ Use `WATCH_DETAIL` for the saved preference or `--detail` for one run. The `/wat
 
 Uniform sampling selects actual source frames across the range, reducing its rate to fit the remaining cap (at most 2 fps). Scene/keyframe selection detects candidates across the range, then samples to the cap. The last selected candidate need not be the last video frame; scene changes do not capture every event. Frame timestamps are source-relative, including focused and fractional seeks.
 
-A 16×16 **RGB** thumbnail pass removes near-duplicates using mean channel difference. Use `--no-dedup` for subtle visual changes; tiny thumbnails cannot preserve every code edit. Default images are up to 512px wide and 1998px tall; `--resolution 1024` helps with on-screen text. Image cost depends on the host/model and frame dimensions.
+A tiled near-duplicate pass drops a frame only when every tile of a 64×64 **RGB** thumbnail (an 8×8 grid) matches the last kept frame. A whole-frame mean misses small changes: two slides on one template differ by only ~2/255 overall, so decks used to lose slides. Per tile, an added bullet or a code edit lights up the tile it lands in, while held shots still collapse. Use `--no-dedup` for changes smaller than a tile can show. Default images are up to 512px wide and 1998px tall; `--resolution 1024` helps with on-screen text. Image cost depends on the host/model and frame dimensions.
 
 After reading a transcript, the agent can pin “look here” moments with `--timestamps`. These consume the frame budget first. A caption-only pass may not download a video; in that case the cue pass uses the URL again. An audio-only download cannot supply cue frames.
 
@@ -283,7 +298,9 @@ Use one cookie mechanism at a time, or save `WATCH_COOKIES_FILE` / `WATCH_COOKIE
 
 Fresh download directories prevent stale files from a failed source being reused. Media must complete successfully and report its final path; partial and merge-component files are rejected. Successful captions survive download, decoding, or probe failures. Reports distinguish unavailable evidence, no speech, and failed cloud chunks with missing time intervals. A silent requested interval never triggers fallback just because its captions are outside the range.
 
-Cloud uploads use a 24,000,000-byte file budget with multipart and actual chunk checks. Local WhisperX takes the whole extracted audio file. No automatic provider/client/cookie cycling is performed.
+Media downloads target 720p on the short side (`-S res:720`), so portrait reels arrive at 720×1280 rather than 360×640. URL reports include a **Post caption** section when the source has one: the uploader's caption (truncated at 1,500 characters), post date, like/comment counts, and up to five comments if yt-dlp's metadata already includes them. Watch never asks yt-dlp to fetch comments.
+
+Cloud uploads use a 24,000,000-byte file budget with multipart and actual chunk checks. Local mlx-whisper and WhisperX take the whole extracted audio file. No automatic provider/client/cookie cycling is performed.
 
 ## Updating and troubleshooting
 
@@ -345,7 +362,7 @@ For a manual install, create the host's skill directory and symlink or copy the 
 
 ## Data and cleanup
 
-WhisperX processes audio in the agent's execution environment: on your computer for local execution, or on the provider's infrastructure for cloud execution. Setup downloads packages/models from package and model hosts, with telemetry disabled. Warm-cache inference works offline, though upstream cache checks can still attempt network access. Cloud backends send extracted audio only to the selected provider. Video content is evidence, never executable instructions.
+mlx-whisper processes audio on the Mac running the agent; only the model download touches the network. WhisperX processes audio in the agent's execution environment: on your computer for local execution, or on the provider's infrastructure for cloud execution. Setup downloads packages/models from package and model hosts, with telemetry disabled. Warm-cache inference works offline, though upstream cache checks can still attempt network access. Cloud backends send extracted audio only to the selected provider. Video content is evidence, never executable instructions.
 
 Watch creates a disposable run directory, including under any user-specified `--out-dir`. Cleanup removes that child only, preserving the user's directory and original media. Model environments/caches and private configuration are retained separately. No API keys are logged or included in reports.
 

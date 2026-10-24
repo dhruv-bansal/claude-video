@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Transcribe a video via local WhisperX or the Groq/OpenAI Whisper APIs.
+"""Transcribe a video via local mlx-whisper / WhisperX or the Groq/OpenAI Whisper APIs.
 
 Strategy: extract audio (mono 16kHz mp3, tiny payload), upload to whichever
 API has a key. Returns segments in the same shape as transcribe.parse_vtt so
 the rest of the pipeline (filter_range, format_transcript) doesn't care where
-the transcript came from.
+the transcript came from. Every Whisper result is checked for silent failures
+(verify.py) and the result attached as `segments.quality`. The local mlx path
+and its repairs live in local_whisper.py; this file only routes to them.
 
 Pure stdlib — no `pip install groq` or `pip install openai` needed.
 """
@@ -26,6 +28,10 @@ from urllib.request import Request, urlopen
 from config import load_api_key, ConfigError
 from runtime import configure_stdio, run_text
 from transcribe import Segments, normalize_segments
+# Local (Apple Silicon) backend and transcript verification live in their own
+# modules; this file only routes to them.
+from local_whisper import mlx_available, model_cached, repair_loops, repair_truncated, transcribe_mlx
+from verify import report_quality, verify_segments
 
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -69,12 +75,36 @@ def plan_chunks(
     return plan
 
 
+def resolve_backend(choice: str, load_key=load_api_key) -> tuple[str | None, str | None]:
+    """Map a configured backend choice to (backend, api_key), or (None, None).
+
+    auto: local mlx when `mlx_whisper` is installed (free, private, no upload),
+    then Groq, then OpenAI. WhisperX is explicit-only. A pinned backend never
+    falls back to another one; (None, None) lets the caller explain why.
+    `load_key` is injectable so callers keep their own patch points.
+    """
+    if choice == "whisperx":
+        return "whisperx", None
+    if choice == "mlx" or (choice == "auto" and mlx_available()):
+        return ("mlx", None) if mlx_available() else (None, None)
+    if choice in ("auto", "groq", "openai"):
+        return load_key(None if choice == "auto" else choice)
+    return None, None
+
+
 def extract_audio(video_path: str, out_path: Path) -> Path:
-    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
+    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit.
+
+    A `.wav` out_path yields 16-bit PCM instead (what a local Whisper consumes
+    natively; there is no upload cap to fit)."""
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.suffix.lower() == ".wav":
+        codec = ["-acodec", "pcm_s16le"]
+    else:
+        codec = ["-acodec", "libmp3lame", "-b:a", "64k"]
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -82,10 +112,9 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
         "-y",
         "-i", str(Path(video_path).resolve()),
         "-vn",
-        "-acodec", "libmp3lame",
+        *codec,
         "-ar", "16000",
         "-ac", "1",
-        "-b:a", "64k",
         str(out_path.resolve()),
     ]
     result = run_text(cmd)
@@ -99,6 +128,28 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
 def audio_duration(audio_path: Path) -> float:
     from frames import get_metadata
     return get_metadata(str(audio_path))["duration_seconds"]
+
+
+def _verify_duration(audio_path: Path) -> float:
+    """Duration for verification only: unknown (0) rather than a failed run."""
+    try:
+        return float(audio_duration(audio_path) or 0.0)
+    except (SystemExit, OSError, ValueError, TypeError, KeyError):
+        return 0.0
+
+
+def _with_quality(segments, quality: dict) -> Segments:
+    """Attach the verify result without changing the (segments, backend) shape."""
+    if not isinstance(segments, Segments):
+        segments = Segments(segments, no_speech=not segments)
+    segments.quality = quality
+    return segments
+
+
+def _verified(segments, audio_path: Path, backend: str) -> Segments:
+    quality = verify_segments(list(segments), _verify_duration(audio_path))
+    report_quality(quality, backend)
+    return _with_quality(segments, quality)
 
 
 def split_audio(
@@ -344,24 +395,67 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
     return _segments_from_response(response)
 
 
+def _transcribe_local(video_path: str, audio_out: Path) -> Segments:
+    """The mlx path: PCM audio, one local decode, verify, repair, re-verify."""
+    audio_out = audio_out.with_suffix(".wav")  # no upload cap → no mp3, no chunking
+    print("[watch] extracting audio for Whisper (mlx)…", file=sys.stderr)
+    audio_path = extract_audio(video_path, audio_out)
+    duration = _verify_duration(audio_path)
+    fetch = "" if model_cached() else " (first run downloads the ~1.5 GB model)"
+    print(f"[watch] transcribing {duration / 60:.1f} min locally on the GPU{fetch}…", file=sys.stderr)
+    work_dir = audio_out.parent / "mlx"
+    segs = list(transcribe_mlx(audio_path, work_dir))
+
+    quality = verify_segments(segs, duration, check_window_length=True)
+    if quality["loops"]:
+        segs = repair_loops(segs, quality["loops"], audio_path, work_dir, duration)
+        quality = verify_segments(segs, duration, check_window_length=True)
+    if quality["truncated"]:
+        segs = repair_truncated(segs, quality["truncated"], audio_path, work_dir, duration)
+        quality = verify_segments(segs, duration, check_window_length=True)
+    report_quality(quality, "mlx")
+    if not segs:
+        print("[watch] Whisper detected no speech", file=sys.stderr)
+    print(f"[watch] transcribed {len(segs)} segments via mlx", file=sys.stderr)
+    return _with_quality(Segments(segs, no_speech=not segs), quality)
+
+
 def transcribe_video(
     video_path: str,
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    *,
+    api_fallback: bool = False,
 ) -> tuple[list[dict], str]:
-    """Run the full flow: extract audio → upload → parse segments.
+    """Run the full flow: extract audio → transcribe → verify → parse segments.
 
-    Returns (segments, backend_used). Raises SystemExit on any failure.
+    Returns (segments, backend_used); `segments.quality` carries the
+    verify_segments result. Raises SystemExit on any failure. With
+    `api_fallback` (mlx chosen by "auto", not pinned), a local mlx failure
+    falls through to an API key if one is set, so a broken pipx venv or an
+    interrupted model download never costs a user their working Groq path.
     """
     if api_key is not None and backend is None:
         raise SystemExit("An API key requires an explicit groq or openai backend.")
+    if backend == "mlx":
+        if api_key is not None:
+            raise SystemExit("mlx-whisper does not accept an API key.")
+        try:
+            return _transcribe_local(video_path, audio_out), "mlx"
+        except SystemExit as exc:
+            fallback, fallback_key = load_api_key() if api_fallback else (None, None)
+            if not fallback:
+                raise
+            print(f"[watch] local mlx failed ({exc}) — falling back to {fallback}", file=sys.stderr)
+            backend, api_key = fallback, fallback_key
     if backend == "whisperx":
         if api_key is not None:
             raise SystemExit("WhisperX does not accept an API key.")
         from local_whisperx import transcribe_audio
-        segments = transcribe_audio(extract_audio(video_path, audio_out))
-        return segments, "whisperx"
+        audio_path = extract_audio(video_path, audio_out)
+        segments = transcribe_audio(audio_path)
+        return _verified(segments, audio_path, "whisperx"), "whisperx"
     if backend not in (None, "groq", "openai"):
         raise SystemExit("Unknown transcription backend.")
     if backend is None or api_key is None:
@@ -406,6 +500,7 @@ def transcribe_video(
     if not segments:
         print("[watch] Whisper detected no speech", file=sys.stderr)
 
+    segments = _verified(segments, audio_path, backend)
     print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
     return segments, backend
 
@@ -416,10 +511,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Transcribe local media with the selected Whisper backend.")
     parser.add_argument("video")
     parser.add_argument("audio_out", nargs="?", default="audio.mp3", type=Path)
-    parser.add_argument("--backend", choices=["groq", "openai", "whisperx"])
+    parser.add_argument("--backend", choices=["mlx", "groq", "openai", "whisperx"])
     args = parser.parse_args()
     try:
         segments, backend = transcribe_video(args.video, Path(args.audio_out), backend=args.backend)
     except ConfigError as exc:
         raise SystemExit(str(exc)) from None
-    print(json.dumps({"backend": backend, "segments": segments}, indent=2))
+    print(json.dumps({"backend": backend, "quality": getattr(segments, "quality", None),
+                      "segments": segments}, indent=2))

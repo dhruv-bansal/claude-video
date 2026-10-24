@@ -117,3 +117,11 @@ def test_invalid_engine_and_timeout_rejected(monkeypatch):
     monkeypatch.setenv('WATCH_GEMINI_TIMEOUT', '-5')
     with pytest.raises(config.ConfigError, match='WATCH_GEMINI_TIMEOUT'):
         config.get_config()
+
+
+def test_mlx_is_a_valid_backend(monkeypatch):
+    monkeypatch.setenv('WATCH_WHISPER_BACKEND', 'mlx')
+    assert config.get_config()['whisper_backend'] == 'mlx'
+    monkeypatch.setenv('WATCH_WHISPER_BACKEND', 'deepgram')
+    with pytest.raises(config.ConfigError, match='mlx'):
+        config.get_config()

@@ -214,3 +214,104 @@ def test_no_speech_and_malformed_response_differ():
     assert whisper._segments_from_response({'segments': []}).no_speech
     with pytest.raises(SystemExit, match='malformed'):
         whisper._segments_from_response({'text': 'timestamps missing'})
+
+
+# --- backend resolution: auto = mlx → Groq → OpenAI; pinned never falls back ---
+
+class TestResolveBackend:
+    @pytest.fixture
+    def mlx(self, monkeypatch):
+        import local_whisper
+        def set_available(value):
+            monkeypatch.setattr(local_whisper, 'mlx_path', lambda: '/fake/mlx_whisper' if value else None)
+        return set_available
+
+    def test_auto_prefers_mlx_when_installed(self, monkeypatch, mlx):
+        mlx(True)
+        monkeypatch.setenv('GROQ_API_KEY', 'sk-groq')
+        assert whisper.resolve_backend('auto') == ('mlx', None)
+
+    def test_auto_falls_back_to_groq_then_openai(self, monkeypatch, mlx):
+        mlx(False)
+        monkeypatch.setenv('OPENAI_API_KEY', 'sk-oa')
+        assert whisper.resolve_backend('auto') == ('openai', 'sk-oa')
+        monkeypatch.setenv('GROQ_API_KEY', 'sk-groq')
+        assert whisper.resolve_backend('auto') == ('groq', 'sk-groq')
+
+    def test_auto_nothing_available(self, mlx):
+        mlx(False)
+        assert whisper.resolve_backend('auto') == (None, None)
+
+    def test_pinned_mlx_without_binary_does_not_fall_back(self, monkeypatch, mlx):
+        mlx(False)
+        monkeypatch.setenv('GROQ_API_KEY', 'sk-groq')
+        assert whisper.resolve_backend('mlx') == (None, None)
+
+    def test_pinned_api_ignores_mlx(self, monkeypatch, mlx):
+        mlx(True)
+        monkeypatch.setenv('OPENAI_API_KEY', 'sk-oa')
+        assert whisper.resolve_backend('openai') == ('openai', 'sk-oa')
+        assert whisper.resolve_backend('groq') == (None, None)
+
+    def test_whisperx_stays_explicit_and_none_disables(self, mlx):
+        mlx(True)
+        assert whisper.resolve_backend('whisperx') == ('whisperx', None)
+        assert whisper.resolve_backend('none') == (None, None)
+
+    def test_injected_key_loader_is_used(self, mlx):
+        mlx(False)
+        assert whisper.resolve_backend('auto', load_key=lambda preferred: ('groq', 'patched')) == ('groq', 'patched')
+
+
+class TestExtractAudioWav:
+    def test_wav_suffix_yields_pcm(self, tmp_path: Path):
+        video = tmp_path / 'v.mp4'
+        subprocess.run(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+             '-f', 'lavfi', '-t', '2', '-i', 'color=c=blue:s=64x64:r=5',
+             '-f', 'lavfi', '-t', '2', '-i', 'sine=frequency=440:sample_rate=16000',
+             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', str(video)],
+            check=True,
+        )
+        out = whisper.extract_audio(str(video), tmp_path / 'audio.wav')
+        assert out.read_bytes()[:4] == b'RIFF'
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries',
+             'stream=codec_name,sample_rate,channels', '-of', 'csv=p=0', str(out)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert probe == 'pcm_s16le,16000,1'
+
+
+# --- every Whisper backend is verified; only mlx repairs ----------------------
+
+def test_api_result_carries_quality_and_flags_truncation(monkeypatch, tmp_path, capsys):
+    audio = tmp_path / 'audio.mp3'
+    audio.write_bytes(b'x')
+    monkeypatch.setattr(whisper, 'extract_audio', lambda *a: audio)
+    monkeypatch.setattr(whisper, 'audio_duration', lambda *a: 70.0)
+    monkeypatch.setattr(whisper, '_transcribe_file', lambda *a: whisper._segments_from_response(
+        {'segments': [{'start': 0, 'end': 30, 'text': 'cut �'}, {'start': 30, 'end': 39, 'text': 'rest'},
+                      {'start': 39, 'end': 69, 'text': 'a long but complete API cue'}]}))
+    monkeypatch.setattr(whisper, 'repair_truncated', lambda *a: pytest.fail('API backends are never repaired'))
+    segments, backend = whisper.transcribe_video('video', audio, backend='groq', api_key='dummy')
+    assert backend == 'groq' and len(segments) == 3
+    assert segments.quality['ok'] is False and [t['end'] for t in segments.quality['truncated']] == [30.0]
+    assert 'looks truncated' in capsys.readouterr().err
+
+
+def test_whisperx_result_is_verified(monkeypatch, tmp_path):
+    import local_whisperx
+    from transcribe import Segments
+    audio = tmp_path / 'audio.mp3'
+    monkeypatch.setattr(whisper, 'extract_audio', lambda *a: audio)
+    def unprobeable(*a):
+        raise SystemExit('ffprobe failed')  # verification must not fail the run over a duration
+    monkeypatch.setattr(whisper, 'audio_duration', unprobeable)
+    loop = [{'start': i, 'end': i + 1, 'text': 'Thank you.'} for i in range(3)]
+    chunks = [{'start': 3.5, 'end': 33.3, 'text': 'one merged 29.8 s VAD chunk'}]  # normal for --no_align
+    monkeypatch.setattr(local_whisperx, 'transcribe_audio', lambda path: Segments(loop + chunks))
+    segments, backend = whisper.transcribe_video('video', audio, backend='whisperx')
+    assert backend == 'whisperx'
+    assert segments.quality['ok'] is False and len(segments.quality['loops']) == 1
+    assert segments.quality['truncated'] == []
